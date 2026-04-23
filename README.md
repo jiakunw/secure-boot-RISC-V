@@ -23,6 +23,49 @@ the project:
 4. **Anti-rollback protection** (monotonic counter)
 5. **Post-boot isolation** (PMP with Lock)
 
+### 1.1 Establish Connection with chipyard
+
+Assume you have successfully setup chipyard and have enabled its virtual environment.
+
+Create `.env` in the main directory, then  setup `CHIPYARD_HOME`:
+```
+$CHIPYARD_HOME = /path/to/yout/chipyard_repo
+```
+
+go to `script`
+
+run
+```
+./integrate_to_chipyard.sh
+```
+
+This will integrates your secure-boot project into Chipyard by symlinking the Chisel sources, building the BootROM image and copying it into Chipyard's resource directory, copying the kernel sources into Chipyard's tests folder, patching its CMakeLists.txt to add a kernel target, compiling the kernel, and copying both the ELF and raw binary back to your repo.
+
+If you run into permission issue, run this
+```
+chmod +x scripts/integrate_to_chipyard.sh
+```
+
+### 1.2 Start the CPU
+
+Run the following command to build the simulator:
+```
+cd $CHIPYARD_HOME/sims/verilator
+make CONFIG=RocketConfig
+```
+Note that when it's your first time running it, it'll take 20-30min
+
+Ryn this command to run the kernel
+
+```
+./simulator-chipyard.harness-RocketConfig \
+    ~/Development/secure-boot-RISC-V/software/kernel/kernel.riscv
+```
+
+Later on we will replace `CONFIG=RocketConfig` with `CONFIG=SecureBootConfig` (whoever works on the bootloader will be responsible).
+
+FESVR will read `kernel.riscv` and add this to it's fake DRAM. This contains kernel code. Before using SPI Flash, we need to load `flash_image` into this fake DRAM as well. So whoever is working on the bootloader will be responsible for this.
+
 ---
 
 ## 2. Threat Model
@@ -423,35 +466,45 @@ cd tests
 
 ## 10. Files
 
+```
 secure-boot-RISC-V/
 ├── README.md                         (this file)
 ├── .env.example
-├── hardware/secureboot/
-│   ├── OTP.scala                     (OTP MMIO peripheral)
-│   ├── RollbackCounter.scala         (counter MMIO peripheral)
-│   └── SecureBootConfig.scala        (Chipyard config)
+├── docs                              (saves docs)
+├── flash_image
+|   └── flash_image.bin
+├── metadata/
+|   ├── manifest.bin
+|   ├── private_key.bin
+|   ├── pubkey_hash.bin
+|   └── public_key.bin
+├── hardware/
+|   ├── otp/
+|   ├── rollback_counter/
+|   └── spi_flash/
 ├── software/
 │   ├── bootrom/
 │   │   ├── bootrom.S                 (startup assembly)
-│   │   ├── bootrom.c                 (verification logic)
+│   │   ├── bootrom.c                 (verification logic, to be added)
 │   │   ├── linker.ld                 (BootROM linker script)
-│   │   └── Makefile
+│   │   └── Makefile                  (build bootrom.img)
 │   ├── crypto/
-│   │   ├── sha256.c, sha256.h        (RFC 6234 reference)
-│   │   └── monocypher.c, monocypher.h
+│   │   ├── include/
+|   |   |   ├── monocypher.h
+|   |   |   └── sha256.h
+|   |   ├── src/
+│   |   |   ├── monocypher.c
+|   |   |   └── sha256.c
 │   ├── kernel/
 │   │   ├── kernel.c                  (demo kernel)
-│   │   ├── kernel.ld
-│   │   └── Makefile
-│   └── signing_tool/
-│       ├── sign_firmware.py
-│       └── requirements.txt
-├── tests/
-│   ├── test_tampered_kernel.sh
-│   ├── test_wrong_pubkey.sh
-│   ├── test_bad_signature.sh
-│   ├── test_rollback_attempt.sh
-│   └── test_pmp_enforcement.sh
+│   │   ├── kernel.bin 
+|   |   ├── kernel.riscv
+|   |   ├── manifest.h                (manifest)
+│   │   └── Makefile                  
+├── tools/
+│   ├── key_generator.py              (generate a key pair in binary)
+│   ├── manifest_generator.py         (generate the manifest in binary)
+│   └── sign_firmware.py              (generate the manifest signature in binary)
 └── scripts/
-├── integrate_to_chipyard.sh
-└── build_and_run.sh
+    └── integrate_to_chipyard.sh
+```
