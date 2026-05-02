@@ -51,18 +51,16 @@ chmod +x scripts/integrate_to_chipyard.sh
 Run the following command to build the simulator:
 ```
 cd $CHIPYARD_HOME/sims/verilator
-make CONFIG=RocketConfig
+make CONFIG=SecureBootConfig
 ```
 Note that when it's your first time running it, it'll take 20-30min
 
 Ryn this command to run the kernel
 
 ```
-./simulator-chipyard.harness-RocketConfig \
+./simulator-chipyard.harness-SecureBootConfig \
     ~/Development/secure-boot-RISC-V/software/kernel/kernel.riscv
 ```
-
-Later on we will replace `CONFIG=RocketConfig` with `CONFIG=SecureBootConfig` (whoever works on the bootloader will be responsible).
 
 FESVR will read `kernel.riscv` and add this to it's fake DRAM. This contains kernel code. Before using SPI Flash, we need to load `flash_image` into this fake DRAM as well. So whoever is working on the bootloader will be responsible for this.
 
