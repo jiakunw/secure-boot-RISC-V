@@ -45,20 +45,49 @@ echo "RISCV toolchain:   $(which riscv64-unknown-elf-gcc)"
 # ─────────────────────────────────────────────
 echo ""
 echo "[1/5] Linking Chisel sources..."
-if ls $MYREPO/hardware/secureboot/*.scala 1> /dev/null 2>&1; then
-    mkdir -p $CHIPYARD/generators/chipyard/src/main/scala/secureboot
-    
-    # Clean stale symlinks first (in case files were renamed/deleted)
-    find $CHIPYARD/generators/chipyard/src/main/scala/secureboot \
-         -maxdepth 1 -type l -delete 2>/dev/null || true
-    
-    ln -sf $MYREPO/hardware/secureboot/*.scala \
-           $CHIPYARD/generators/chipyard/src/main/scala/secureboot/
-    
-    SCALA_COUNT=$(ls $MYREPO/hardware/secureboot/*.scala 2>/dev/null | wc -l)
+SCALA_OUT_DIR=$CHIPYARD/generators/chipyard/src/main/scala/secureboot
+SCALA_SOURCES=$(find "$MYREPO/hardware" -path "*/tb/*" -prune -o -name "*.scala" -type f -print)
+
+if [ -n "$SCALA_SOURCES" ]; then
+    mkdir -p "$SCALA_OUT_DIR"
+    find "$SCALA_OUT_DIR" -maxdepth 1 -type l -delete 2>/dev/null || true
+
+    while IFS= read -r src; do
+        ln -sf "$src" "$SCALA_OUT_DIR/"
+        echo "  Linked $(basename "$src")"
+    done <<< "$SCALA_SOURCES"
+
+    SCALA_COUNT=$(echo "$SCALA_SOURCES" | wc -l)
     echo "  Linked $SCALA_COUNT Chisel file(s)."
 else
     echo "  (No Chisel sources yet, skipping)"
+fi
+
+echo ""
+echo "[1b/5] Preparing flash image hex..."
+if [ -f "$MYREPO/tools/flash_image_to_hex.py" ] && [ -f "$MYREPO/flash_image/flash_image.bin" ]; then
+    python3 "$MYREPO/tools/flash_image_to_hex.py" \
+        --input "$MYREPO/flash_image/flash_image.bin" \
+        --output "$MYREPO/flash_image/flash_image.hex"
+    mkdir -p "$CHIPYARD/sims/verilator/flash_image"
+    cp "$MYREPO/flash_image/flash_image.hex" "$CHIPYARD/sims/verilator/flash_image/"
+    echo "  Copied flash_image.hex for Verilator elaboration."
+else
+    echo "  (No flash image converter/input found, skipping)"
+fi
+
+echo ""
+echo "[1c/5] Patching Chipyard DigitalTop for secure boot SPI..."
+DIGITAL_TOP=$CHIPYARD/generators/chipyard/src/main/scala/DigitalTop.scala
+if [ -f "$DIGITAL_TOP" ]; then
+    if ! grep -q "CanHavePeripherySecureBootSPI" "$DIGITAL_TOP"; then
+        sed -i.bak '/with chipyard.example.CanHavePeripheryGCD/i\  with chipyard.CanHavePeripherySecureBootSPI // Enables the secure-boot MMIO SPI controller' "$DIGITAL_TOP"
+        echo "  Added CanHavePeripherySecureBootSPI to DigitalTop."
+    else
+        echo "  DigitalTop already patched."
+    fi
+else
+    echo "  Warning: DigitalTop.scala not found; SPI peripheral will not instantiate."
 fi
 
 # ─────────────────────────────────────────────
@@ -72,6 +101,9 @@ if [ -f "$MYREPO/software/bootrom/Makefile" ]; then
     if [ -f "bootrom.img" ]; then
         cp bootrom.img \
            $CHIPYARD/generators/testchipip/src/main/resources/testchipip/bootrom/bootrom.secureboot.rv64.img
+        mkdir -p "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.SecureBootConfig"
+        cp bootrom.img \
+           "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.SecureBootConfig/bootrom.secureboot.rv64.img"
         echo "  Built and copied to Chipyard."
         echo "  Size: $(stat -c%s bootrom.img) bytes"
     else
@@ -133,8 +165,8 @@ cmake -S "$TESTS_DIR" -B "$TESTS_DIR/build" -D CMAKE_BUILD_TYPE=Debug
 
 cmake --build "$TESTS_DIR/build" --target kernel
 
-ELF_PATH="$TESTS_DIR/build/kernel.riscv"
-BIN_PATH="$TESTS_DIR/build/kernel.bin"
+ELF_PATH="$TESTS_DIR/kernel.riscv"
+BIN_PATH="$TESTS_DIR/kernel.bin"
 KERNEL_REPO_DIR="$MYREPO/software/kernel"
 
 if [ -f "$ELF_PATH" ]; then
