@@ -4,7 +4,12 @@ GCC      = riscv64-unknown-elf-gcc
 OBJCOPY  = riscv64-unknown-elf-objcopy
 OBJDUMP  = riscv64-unknown-elf-objdump
 
-CFLAGS_RV64 = -mabi=lp64 -march=rv64ima_zicsr
+CFLAGS_RV64 = -mabi=lp64 -march=rv64ima_zicsr_zifencei
+CFLAGS_BOOT = -ffreestanding -fno-builtin -fno-stack-protector
+INCLUDES = -I../crypto/include
+
+# build startup, bootrom C, and sha256
+SRCS = bootrom.S bootrom.c ../crypto/src/sha256.c
 
 TARGET = bootrom.img
 
@@ -13,8 +18,8 @@ default: $(TARGET) bootrom.dump
 bootrom.img: bootrom.elf
 	$(OBJCOPY) -O binary --change-addresses=-0x10000 $< $@
 
-bootrom.elf: bootrom.S linker.ld
-	$(GCC) $(CFLAGS_RV64) -Tlinker.ld $< -nostdlib -static -o $@
+bootrom.elf: $(SRCS) linker.ld
+	$(GCC) $(CFLAGS_RV64) $(CFLAGS_BOOT) $(INCLUDES) -Tlinker.ld $(SRCS) -nostdlib -static -o $@
 
 bootrom.dump: bootrom.elf
 	$(OBJDUMP) -d $< > $@

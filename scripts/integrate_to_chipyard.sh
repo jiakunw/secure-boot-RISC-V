@@ -96,7 +96,7 @@ fi
 echo ""
 echo "[2/5] Building BootROM..."
 if [ -f "$MYREPO/software/bootrom/Makefile" ]; then
-    cd $MYREPO/software/bootrom
+    cd "$MYREPO/software/bootrom"
     make
     if [ -f "bootrom.img" ]; then
         cp bootrom.img \
