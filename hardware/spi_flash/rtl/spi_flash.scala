@@ -18,7 +18,7 @@ case class SecureBootSPIParams(
 
 case object SecureBootSPIKey extends Field[Option[SecureBootSPIParams]](None)
 
-class SPIFlashPort extends Bundle {
+class SecureBootSPIPort extends Bundle {
   val cs_n = Output(Bool())
   val sclk = Output(Bool())
   val mosi = Output(Bool())
@@ -155,7 +155,7 @@ class SPIMasterCore extends Module {
     val done = Output(Bool())
     val error = Output(Bool())
     val remainingBytes = Output(UInt(32.W))
-    val spi = new SPIFlashPort
+    val spi = new SecureBootSPIPort
   })
 
   val sIdle :: sSendSetup :: sSendRise :: sReadSetup :: sReadRise :: sEmit :: sDone :: Nil = Enum(7)

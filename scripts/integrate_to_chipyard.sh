@@ -6,6 +6,7 @@ set -e
 # ─────────────────────────────────────────────
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+export SECURE_BOOT_REPO="$REPO_ROOT"
 
 if [ ! -f "$REPO_ROOT/.env" ]; then
     echo "Error: .env not found at $REPO_ROOT/.env"
@@ -77,17 +78,31 @@ else
 fi
 
 echo ""
-echo "[1c/5] Patching Chipyard DigitalTop for secure boot SPI..."
+echo "[1c/5] Patching Chipyard DigitalTop for secure boot peripherals (OTP + Rollback + SPI)..."
 DIGITAL_TOP=$CHIPYARD/generators/chipyard/src/main/scala/DigitalTop.scala
 if [ -f "$DIGITAL_TOP" ]; then
+    if ! grep -q "CanHavePeripherySecureBootOTP" "$DIGITAL_TOP"; then
+        sed -i.bak '/with chipyard.example.CanHavePeripheryGCD/i\  with chipyard.CanHavePeripherySecureBootOTP // OTP for pubkey hash root of trust' "$DIGITAL_TOP"
+        echo "  Added CanHavePeripherySecureBootOTP to DigitalTop."
+    else
+        echo "  CanHavePeripherySecureBootOTP already patched."
+    fi
+
+    if ! grep -q "CanHavePeripherySecureBootRollback" "$DIGITAL_TOP"; then
+        sed -i.bak '/with chipyard.example.CanHavePeripheryGCD/i\  with chipyard.CanHavePeripherySecureBootRollback // Anti-rollback monotonic counter' "$DIGITAL_TOP"
+        echo "  Added CanHavePeripherySecureBootRollback to DigitalTop."
+    else
+        echo "  CanHavePeripherySecureBootRollback already patched."
+    fi
+
     if ! grep -q "CanHavePeripherySecureBootSPI" "$DIGITAL_TOP"; then
         sed -i.bak '/with chipyard.example.CanHavePeripheryGCD/i\  with chipyard.CanHavePeripherySecureBootSPI // Enables the secure-boot MMIO SPI controller' "$DIGITAL_TOP"
         echo "  Added CanHavePeripherySecureBootSPI to DigitalTop."
     else
-        echo "  DigitalTop already patched."
+        echo "  CanHavePeripherySecureBootSPI already patched."
     fi
 else
-    echo "  Warning: DigitalTop.scala not found; SPI peripheral will not instantiate."
+    echo "  Warning: DigitalTop.scala not found; secure boot peripherals will not instantiate."
 fi
 
 # ─────────────────────────────────────────────
@@ -165,8 +180,8 @@ cmake -S "$TESTS_DIR" -B "$TESTS_DIR/build" -D CMAKE_BUILD_TYPE=Debug
 
 cmake --build "$TESTS_DIR/build" --target kernel
 
-ELF_PATH="$TESTS_DIR/kernel.riscv"
-BIN_PATH="$TESTS_DIR/kernel.bin"
+ELF_PATH="$TESTS_DIR/build/kernel.riscv"
+BIN_PATH="$TESTS_DIR/build/kernel.bin"
 KERNEL_REPO_DIR="$MYREPO/software/kernel"
 
 if [ -f "$ELF_PATH" ]; then
