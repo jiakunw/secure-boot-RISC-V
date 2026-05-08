@@ -2,6 +2,7 @@
 #include <stddef.h>
 
 #include "sha256.h"
+#include "monocypher.h"
 
 #define SPI_BASE      0xF0002000UL
 #define SPI_ADDR      (SPI_BASE + 0x00)
@@ -79,6 +80,27 @@ static void halt(void)
     while (1) {
         __asm__ volatile ("wfi");
     }
+}
+
+/* freestanding memset / memcpy for MonoCypher under -nostdlib; volatile pointers
+ * prevent GCC from replacing the loop with a self-recursive call to memset */
+void *memset(void *dst, int value, size_t total_bytes)
+{
+    volatile uint8_t *output = (volatile uint8_t *)dst;
+    for (size_t i = 0; i < total_bytes; i++) {
+        output[i] = (uint8_t)value;
+    }
+    return dst;
+}
+
+void *memcpy(void *dst, const void *src, size_t total_bytes)
+{
+    volatile uint8_t *output = (volatile uint8_t *)dst;
+    const volatile uint8_t *input = (const volatile uint8_t *)src;
+    for (size_t i = 0; i < total_bytes; i++) {
+        output[i] = input[i];
+    }
+    return dst;
 }
 
 /* writes one word to a hardware register */
@@ -212,34 +234,24 @@ static void check_manifest_header(const manifest_t *manifest)
     }
 }
 
-/* hashes the public key now, otp compare goes in after otp is done */
+/* hashes the flash pubkey and compares it against the immutable OTP-anchored hash */
 static void check_public_key(void)
 {
     sha256_hash(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE, PUBLIC_KEY_HASH);
 
-    /*
-     * will implement once otp hardware is done.
-     *
-     * read_otp_hash(OTP_HASH_BUFFER);
-     *
-     * if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) {
-     *     halt();
-     * }
-     */
+    read_otp_hash(OTP_HASH_BUFFER);
+
+    if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) {
+        halt();
+    }
 }
 
-/* signature check goes in after real ed25519 is done */
+/* DIAGNOSTIC: Stage 2 temporarily bypassed to isolate which stage halts */
 static void check_manifest_signature(void)
 {
-    /*
-     * will implement once real ed25519 is done.
-     *
-     * if (!ed25519_check(SIGNATURE_BUFFER,
-     *                    PUBLIC_KEY_BUFFER,
-     *                    MANIFEST_BUFFER,
-     *                    MANIFEST_SIZE)) {
-     *     halt();
-     * }
+    /* TODO restore:
+     * if (crypto_eddsa_check(SIGNATURE_BUFFER, PUBLIC_KEY_BUFFER,
+     *                        MANIFEST_BUFFER, MANIFEST_SIZE) != 0) halt();
      */
 }
 
@@ -278,25 +290,19 @@ static void check_and_load_kernel(const manifest_t *manifest)
     }
 }
 
-/* rollback check goes in after rollback counter hardware is done */
+/* enforces monotonic version: halt on downgrade, advance counter on upgrade */
 static void check_rollback_counter(const manifest_t *manifest)
 {
-    (void)manifest;
+    uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
+    uint64_t version = (uint64_t)manifest->version;
 
-    /*
-     * will implement once rollback counter hardware is done.
-     *
-     * uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
-     * uint64_t version = manifest->version;
-     *
-     * if (version < counter) {
-     *     halt();
-     * }
-     *
-     * if (version > counter) {
-     *     write_register64(ROLLBACK_COUNTER_BASE, version);
-     * }
-     */
+    if (version < counter) {
+        halt();
+    }
+
+    if (version > counter) {
+        write_register64(ROLLBACK_COUNTER_BASE, version);
+    }
 }
 
 /* pmp uses napot encoding for locked regions */
@@ -372,24 +378,80 @@ static void jump_to_kernel(uint32_t entry_point)
     halt();
 }
 
+/* DEBUG: SiFive UART at 0x10020000. txdata bit 31 = full, txctrl bit 0 = enable */
+#define UART_BASE   0x10020000UL
+#define UART_TXDATA (UART_BASE + 0x00)
+#define UART_TXCTRL (UART_BASE + 0x08)
+#define UART_DIV    (UART_BASE + 0x18)
+
+static void uart_init(void)
+{
+    *(volatile uint32_t *)UART_DIV    = 0;   /* simulation: no divider needed */
+    *(volatile uint32_t *)UART_TXCTRL = 1;   /* enable TX */
+}
+
+static void uart_putc(char c)
+{
+    while (*(volatile uint32_t *)UART_TXDATA & 0x80000000u) { }
+    *(volatile uint32_t *)UART_TXDATA = (uint8_t)c;
+}
+
+static void uart_print(const char *s)
+{
+    while (*s) {
+        uart_putc(*s++);
+    }
+}
+
 void bootrom_main(void)
 {
+    /* DIAGNOSTIC step 2 (most decisive): blindly jump to 0x80000000 where
+     * FESVR pre-loaded kernel.riscv. If we see "kernel started successfully",
+     * the simulator + handoff are fine and secure boot is what's broken.
+     * If we still see no output, simulator/HTIF setup is broken. */
+    __asm__ volatile (
+        "fence\n"
+        "fence.i\n"
+        "li t0, 0x80000000\n"
+        "csrw mepc, t0\n"
+        "csrr a0, mhartid\n"
+        "li a1, 0\n"
+        "mret\n"
+        ::: "t0", "a0", "a1", "memory"
+    );
+
+    /* Original flow (unreachable until we re-enable):
     manifest_t *manifest = (manifest_t *)MANIFEST_BUFFER;
     uint32_t entry_point;
 
+    uart_init();
+    uart_print("BOOTROM\n");
+
     read_boot_parts();
+    uart_print("S0\n");
 
     check_manifest_header(manifest);
+    uart_print("S1\n");
+
     check_public_key();
+    uart_print("S2\n");
+
     check_manifest_signature();
+    uart_print("S3\n");
+
     check_and_load_kernel(manifest);
+    uart_print("S4\n");
+
     check_rollback_counter(manifest);
+    uart_print("S5\n");
 
     entry_point = manifest->entry_point;
 
     clear_scratch();
     lock_pmp();
+    uart_print("JMP\n");
     jump_to_kernel(entry_point);
+    */
 
     halt();
 }

@@ -6,8 +6,8 @@ PRIVATE_KEY_PATH = "../metadata/private_key.bin"
 PUBLIC_KEY_PATH  = "../metadata/public_key.bin"
 MANIFEST_PATH    = "../metadata/manifest.bin"
 KERNEL_PATH      = "../software/kernel/kernel.bin"
-SIGNATURE_PATH    = "../metadata/manifest.bin"
-FLASH_IMG_PATH      = "../flash_image/flash_image.bin"
+SIGNATURE_PATH   = "../metadata/signature.bin"
+FLASH_IMG_PATH   = "../flash_image/flash_image.bin"
 
 # 1. Load the Secret Private Key
 if not os.path.exists(PRIVATE_KEY_PATH):
@@ -24,6 +24,8 @@ with open(PUBLIC_KEY_PATH, "rb") as f:
 # 3. Read the Manifest and the Kernel
 with open(MANIFEST_PATH, "rb") as f:
     manifest_bytes = f.read()
+
+assert len(manifest_bytes) == 96, f"manifest must be 96 bytes (got {len(manifest_bytes)}); re-run manifest_generators.py"
 
 with open(KERNEL_PATH, "rb") as f:
     kernel_bytes = f.read()

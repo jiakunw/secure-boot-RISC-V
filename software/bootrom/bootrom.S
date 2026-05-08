@@ -39,7 +39,7 @@ _hang: // reset vector
   csrw mie, a0           // set only MSIP in MIE CSR
   csrs mstatus, a0       // set MIE in mstatus CSR
 
-wfi_loop: // wait for MSIP interrupt to start program execution
+wfi_loop: // wait for MSIP interrupt (FESVR triggers this AFTER loading kernel.riscv into DRAM)
   wfi
   j wfi_loop
 
