@@ -1,3 +1,5 @@
+ENTRY(_start)
+
 SECTIONS
 {
 
@@ -6,16 +8,18 @@ SECTIONS
     STACK_TOP = 0x88010000;
 
     . = ROM_BASE;
-    .text.hang : { *(.text.hang) }
+    /* KEEP() prevents --gc-sections from stripping reset-vector handoff slots
+     * that the SoC reaches by hardwired address rather than by symbol reference */
+    .text.hang : { KEEP(*(.text.hang)) }
 
     . = ROM_BASE + 0x40;
-    .text.start : { *(.text.start) }
+    .text.start : { KEEP(*(.text.start)) }
 
     . = ROM_BASE + 0x80;
-    .text.hang80 : { *(.text.hang80) }
+    .text.hang80 : { KEEP(*(.text.hang80)) }
 
     . = ROM_BASE + 0x100;
-    .text.hang100 : { *(.text.hang100) }
+    .text.hang100 : { KEEP(*(.text.hang100)) }
 
     . = ALIGN(8);
 
