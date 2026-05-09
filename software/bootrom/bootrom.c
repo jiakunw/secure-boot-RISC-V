@@ -234,16 +234,15 @@ static void check_manifest_header(const manifest_t *manifest)
     }
 }
 
-/* hashes the flash pubkey and compares it against the immutable OTP-anchored hash */
+/* INCREMENT 4: Stage 1 stubbed (will re-enable in INCREMENT 5).
+ * Hashes the flash pubkey but skips the OTP comparison for now. */
 static void check_public_key(void)
 {
     sha256_hash(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE, PUBLIC_KEY_HASH);
-
-    read_otp_hash(OTP_HASH_BUFFER);
-
-    if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) {
-        halt();
-    }
+    /* Stage 1 OTP compare disabled until INCREMENT 5:
+     * read_otp_hash(OTP_HASH_BUFFER);
+     * if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) halt();
+     */
 }
 
 /* DIAGNOSTIC: Stage 2 temporarily bypassed to isolate which stage halts */
@@ -290,19 +289,16 @@ static void check_and_load_kernel(const manifest_t *manifest)
     }
 }
 
-/* enforces monotonic version: halt on downgrade, advance counter on upgrade */
+/* INCREMENT 4: Stage 4 stubbed (will re-enable in INCREMENT 6). */
 static void check_rollback_counter(const manifest_t *manifest)
 {
-    uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
-    uint64_t version = (uint64_t)manifest->version;
-
-    if (version < counter) {
-        halt();
-    }
-
-    if (version > counter) {
-        write_register64(ROLLBACK_COUNTER_BASE, version);
-    }
+    (void)manifest;
+    /* Stage 4 rollback compare disabled until INCREMENT 6:
+     * uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
+     * uint64_t version = (uint64_t)manifest->version;
+     * if (version < counter) halt();
+     * if (version > counter) write_register64(ROLLBACK_COUNTER_BASE, version);
+     */
 }
 
 /* pmp uses napot encoding for locked regions */
@@ -405,20 +401,23 @@ static void uart_print(const char *s)
 
 void bootrom_main(void)
 {
-    /* DIAGNOSTIC step 2 (most decisive): blindly jump to 0x80000000 where
-     * FESVR pre-loaded kernel.riscv. If we see "kernel started successfully",
-     * the simulator + handoff are fine and secure boot is what's broken.
-     * If we still see no output, simulator/HTIF setup is broken. */
-    __asm__ volatile (
-        "fence\n"
-        "fence.i\n"
-        "li t0, 0x80000000\n"
-        "csrw mepc, t0\n"
-        "csrr a0, mhartid\n"
-        "li a1, 0\n"
-        "mret\n"
-        ::: "t0", "a0", "a1", "memory"
-    );
+    /* DIAGNOSTIC: only-success-exits.
+     * Magic OK  -> tohost=1 -> $finish at ~240s
+     * Magic BAD -> no tohost write -> hang forever
+     * Non-1 tohost values trigger FESVR syscall handling and confuse exit. */
+    read_boot_parts();
+    /* Force memory ordering: ensure all SPI peripheral / store buffer writes
+     * are visible before the load. fence.i synchronizes the instruction
+     * stream as well (paranoid). */
+    __asm__ volatile ("fence rw, rw" ::: "memory");
+    __asm__ volatile ("fence.i" ::: "memory");
+    uint32_t got = *(volatile uint32_t *)MANIFEST_BUFFER;
+    if (got == MANIFEST_MAGIC) {
+        *(volatile uint64_t *)0x80001e00 = 1;
+    }
+    while (1) {
+        __asm__ volatile ("wfi");
+    }
 
     /* Original flow (unreachable until we re-enable):
     manifest_t *manifest = (manifest_t *)MANIFEST_BUFFER;
