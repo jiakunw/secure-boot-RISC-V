@@ -2,25 +2,22 @@ package chipyard
 
 import org.chipsalliance.cde.config.{Config}
 import freechips.rocketchip.devices.tilelink.{BootROMLocated}
-import freechips.rocketchip.subsystem.{InSubsystem, MaxXLen}
-import freechips.rocketchip.util.SystemFileName
-import chipyard.stage.phases.TargetDirKey
+import freechips.rocketchip.subsystem.{InSubsystem}
+import freechips.rocketchip.util.{ResourceFileName}
 
 class WithSecureBootROM extends Config((site, here, up) => {
   case BootROMLocated(InSubsystem) =>
     up(BootROMLocated(InSubsystem), site).map(_.copy(
-      contentFileName = SystemFileName(s"${site(TargetDirKey)}/bootrom.secureboot.rv${site(MaxXLen)}.img")
+      contentFileName = ResourceFileName("/testchipip/bootrom/bootrom.secureboot.rv64.img")
     ))
 })
 
 class SecureBootConfig extends Config(
   new chipyard.WithSecureBootROM ++
-  // BISECT: temporarily disabled OTP and Rollback Config keys to match
-  // the 84e057b "kernel started" working state. If kernel prints with
-  // these off, the issue is in OTP/Rollback Chisel integration.
-  // new chipyard.WithSecureBootOTP() ++
-  // new chipyard.WithSecureBootRollback() ++
   new chipyard.WithSecureBootSPI(address = 0xF0002000L) ++
+  new chipyard.WithSecureBootOTP() ++
+  // INCREMENT 3: add Rollback Counter peripheral
+  new chipyard.WithSecureBootRollback() ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.AbstractConfig
 )

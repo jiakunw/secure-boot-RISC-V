@@ -30,7 +30,7 @@ Disassembly of section .text.start:
    10044:	f1402573          	csrr	a0,mhartid
    10048:	00050463          	beqz	a0,10050 <_start+0x10>
    1004c:	0380006f          	j	10084 <boot_core>
-   10050:	00458613          	addi	a2,a1,4 # 2000004 <__bss_end+0x1fefedc>
+   10050:	00458613          	addi	a2,a1,4 # 2000004 <__bss_end+0x1fefdbc>
    10054:	00100693          	li	a3,1
 
 0000000000010058 <interrupt_loop>:
@@ -56,7 +56,7 @@ Disassembly of section .text.hang80:
    10098:	00009137          	lui	sp,0x9
    1009c:	8011011b          	addiw	sp,sp,-2047 # 8801 <ROM_BASE-0x77ff>
    100a0:	01011113          	slli	sp,sp,0x10
-   100a4:	05c000ef          	jal	10100 <bootrom_main>
+   100a4:	12c000ef          	jal	101d0 <bootrom_main>
 
 00000000000100a8 <bootrom_returned>:
    100a8:	10500073          	wfi
@@ -80,14 +80,88 @@ Disassembly of section .text.hang80:
 
 Disassembly of section .text:
 
-0000000000010100 <bootrom_main>:
-   10100:	0ff0000f          	fence
-   10104:	0000100f          	fence.i
-   10108:	0010029b          	addiw	t0,zero,1
-   1010c:	01f29293          	slli	t0,t0,0x1f
-   10110:	34129073          	csrw	mepc,t0
-   10114:	f1402573          	csrr	a0,mhartid
-   10118:	00000593          	li	a1,0
-   1011c:	30200073          	mret
-   10120:	10500073          	wfi
-   10124:	ffdff06f          	j	10120 <bootrom_main+0x20>
+0000000000010100 <read_flash>:
+   10100:	780017b7          	lui	a5,0x78001
+   10104:	00179793          	slli	a5,a5,0x1
+   10108:	00a7a023          	sw	a0,0(a5) # 78001000 <__bss_end+0x77ff0db8>
+   1010c:	780017b7          	lui	a5,0x78001
+   10110:	00179793          	slli	a5,a5,0x1
+   10114:	00b7a223          	sw	a1,4(a5) # 78001004 <__bss_end+0x77ff0dbc>
+   10118:	780017b7          	lui	a5,0x78001
+   1011c:	00179793          	slli	a5,a5,0x1
+   10120:	00200713          	li	a4,2
+   10124:	780016b7          	lui	a3,0x78001
+   10128:	78001537          	lui	a0,0x78001
+   1012c:	00e7a423          	sw	a4,8(a5) # 78001008 <__bss_end+0x77ff0dc0>
+   10130:	00169693          	slli	a3,a3,0x1
+   10134:	00100713          	li	a4,1
+   10138:	00151513          	slli	a0,a0,0x1
+   1013c:	00e7a423          	sw	a4,8(a5)
+   10140:	00c68693          	addi	a3,a3,12 # 7800100c <__bss_end+0x77ff0dc4>
+   10144:	00000793          	li	a5,0
+   10148:	01050513          	addi	a0,a0,16 # 78001010 <__bss_end+0x77ff0dc8>
+   1014c:	01800313          	li	t1,24
+   10150:	02b7e063          	bltu	a5,a1,10170 <read_flash+0x70>
+   10154:	780017b7          	lui	a5,0x78001
+   10158:	00179793          	slli	a5,a5,0x1
+   1015c:	00c78793          	addi	a5,a5,12 # 7800100c <__bss_end+0x77ff0dc4>
+   10160:	0007a703          	lw	a4,0(a5)
+   10164:	00277713          	andi	a4,a4,2
+   10168:	fe070ce3          	beqz	a4,10160 <read_flash+0x60>
+   1016c:	00008067          	ret
+   10170:	0006a703          	lw	a4,0(a3)
+   10174:	0007081b          	sext.w	a6,a4
+   10178:	00477713          	andi	a4,a4,4
+   1017c:	00070663          	beqz	a4,10188 <read_flash+0x88>
+   10180:	10500073          	wfi
+   10184:	ffdff06f          	j	10180 <read_flash+0x80>
+   10188:	00887813          	andi	a6,a6,8
+   1018c:	fc0802e3          	beqz	a6,10150 <read_flash+0x50>
+   10190:	00052803          	lw	a6,0(a0)
+   10194:	02079793          	slli	a5,a5,0x20
+   10198:	0207d793          	srli	a5,a5,0x20
+   1019c:	0008081b          	sext.w	a6,a6
+   101a0:	00f608b3          	add	a7,a2,a5
+   101a4:	00e85e3b          	srlw	t3,a6,a4
+   101a8:	01c88023          	sb	t3,0(a7)
+   101ac:	00670a63          	beq	a4,t1,101c0 <read_flash+0xc0>
+   101b0:	00178893          	addi	a7,a5,1
+   101b4:	00088e1b          	sext.w	t3,a7
+   101b8:	0087071b          	addiw	a4,a4,8
+   101bc:	00be6663          	bltu	t3,a1,101c8 <read_flash+0xc8>
+   101c0:	0017879b          	addiw	a5,a5,1
+   101c4:	f8dff06f          	j	10150 <read_flash+0x50>
+   101c8:	00088793          	mv	a5,a7
+   101cc:	fd5ff06f          	j	101a0 <read_flash+0xa0>
+
+00000000000101d0 <bootrom_main>:
+   101d0:	ff010113          	addi	sp,sp,-16
+   101d4:	01100613          	li	a2,17
+   101d8:	00813023          	sd	s0,0(sp)
+   101dc:	01b61613          	slli	a2,a2,0x1b
+   101e0:	06000593          	li	a1,96
+   101e4:	00000513          	li	a0,0
+   101e8:	01100413          	li	s0,17
+   101ec:	00113423          	sd	ra,8(sp)
+   101f0:	01b41413          	slli	s0,s0,0x1b
+   101f4:	f0dff0ef          	jal	10100 <read_flash>
+   101f8:	10040613          	addi	a2,s0,256
+   101fc:	04000593          	li	a1,64
+   10200:	06000513          	li	a0,96
+   10204:	efdff0ef          	jal	10100 <read_flash>
+   10208:	20040613          	addi	a2,s0,512
+   1020c:	02000593          	li	a1,32
+   10210:	0a000513          	li	a0,160
+   10214:	eedff0ef          	jal	10100 <read_flash>
+   10218:	0330000f          	fence	rw,rw
+   1021c:	0000100f          	fence.i
+   10220:	00042703          	lw	a4,0(s0)
+   10224:	544257b7          	lui	a5,0x54425
+   10228:	f5378793          	addi	a5,a5,-173 # 54424f53 <__bss_end+0x54414d0b>
+   1022c:	00f71a63          	bne	a4,a5,10240 <bootrom_main+0x70>
+   10230:	400017b7          	lui	a5,0x40001
+   10234:	00179793          	slli	a5,a5,0x1
+   10238:	00100713          	li	a4,1
+   1023c:	e0e7b023          	sd	a4,-512(a5) # 40000e00 <__bss_end+0x3fff0bb8>
+   10240:	10500073          	wfi
+   10244:	ffdff06f          	j	10240 <bootrom_main+0x70>
