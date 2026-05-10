@@ -158,7 +158,7 @@ class SPIMasterCore extends Module {
     val spi = new SPIFlashPort
   })
 
-  val sIdle :: sSendSetup :: sSendRise :: sReadSetup :: sReadRise :: sEmit :: sDone :: Nil = Enum(7)
+  val sIdle :: sSendSetup :: sSendRise :: sReadSetup :: sReadWait :: sReadRise :: sEmit :: sDone :: Nil = Enum(8)
 
   val state = RegInit(sIdle)
   val txShift = RegInit(0.U(32.W))
@@ -231,6 +231,12 @@ class SPIMasterCore extends Module {
     }
 
     is(sReadSetup) {
+      sclkReg := false.B
+      mosiReg := false.B
+      state := sReadWait
+    }
+
+    is(sReadWait) {
       sclkReg := false.B
       mosiReg := false.B
       state := sReadRise
