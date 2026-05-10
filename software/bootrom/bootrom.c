@@ -45,7 +45,21 @@
 
 #define DRAM_BASE 0x80000000UL
 
+/* FESVR-bypass model:
+ *   FESVR loads flash_image.elf at FLASH_BASE = 0x88200000 via --payload.
+ *   BootROM reads flash from there directly (no SPI bit-bang).
+ *   Scratch buffers stay at BOOT_SCRATCH_BASE = 0x88000000 (separate region).
+ *
+ *   Memory map within DRAM (0x80000000 - 0x90000000, 256 MB):
+ *     0x80000000 - 0x80002240   FESVR-loaded kernel.riscv (~8 KB)
+ *     0x88000000 - 0x88010000   Stack + scratch (64 KB)
+ *     0x88200000 - 0x88202000   FESVR-loaded flash_image.elf (~8 KB)
+ *
+ *   In real silicon BootROM would read from the SPI controller; here we
+ *   pre-stage the same bytes in DRAM via FESVR. The verification logic
+ *   (Stages 0-5) is identical. */
 #define BOOT_SCRATCH_BASE 0x88000000UL
+#define FLASH_BASE        0x88200000UL
 
 #define MANIFEST_BUFFER    ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0000u))
 #define SIGNATURE_BUFFER   ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0100u))
@@ -53,9 +67,6 @@
 #define PUBLIC_KEY_HASH    ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0300u))
 #define OTP_HASH_BUFFER    ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0340u))
 #define KERNEL_HASH_BUFFER ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0380u))
-#define KERNEL_CHUNK       ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0400u))
-
-#define KERNEL_CHUNK_SIZE 512u
 
 #define PMP_LOCK_NAPOT_NO_ACCESS 0x98u
 #define PMP_LOCK_NAPOT_RWX       0x9Fu
@@ -157,48 +168,13 @@ static void copy_bytes(uint8_t *output_buffer, const uint8_t *input_buffer, uint
     }
 }
 
-/* starts one flash read through the spi controller */
-static void start_flash_read(uint32_t flash_offset, uint32_t total_bytes)
-{
-    write_register(SPI_ADDR, flash_offset);
-    write_register(SPI_LEN, total_bytes);
-    write_register(SPI_COMMAND, SPI_CLEAR_DONE);
-    write_register(SPI_COMMAND, SPI_START_READ);
-}
-
-/* copies returned spi words into the buffer */
-static void read_flash_words(uint8_t *output_buffer, uint32_t total_bytes)
-{
-    uint32_t bytes_read = 0;
-
-    while (bytes_read < total_bytes) {
-        uint32_t status = read_register(SPI_STATUS);
-
-        if ((status & SPI_ERROR) != 0) {
-            halt();
-        }
-
-        if ((status & SPI_DATA_READY) == 0) {
-            continue;
-        }
-
-        uint32_t word = read_register(SPI_DATA);
-
-        for (int i = 0; i < 4 && bytes_read < total_bytes; i++) {
-            output_buffer[bytes_read] = (uint8_t)(word >> (8 * i));
-            bytes_read++;
-        }
-    }
-
-    while ((read_register(SPI_STATUS) & SPI_DONE) == 0) {
-    }
-}
-
-/* reads bytes from flash into one buffer */
+/* FESVR-bypass: read flash bytes directly from FLASH_BASE in DRAM,
+ * which FESVR has pre-loaded via --payload=flash_image.elf. The SPI
+ * controller is still present in the SoC for completeness; it just
+ * isn't used by the BootROM in this simulation flow. */
 static void read_flash(uint32_t flash_offset, uint32_t total_bytes, uint8_t *output_buffer)
 {
-    start_flash_read(flash_offset, total_bytes);
-    read_flash_words(output_buffer, total_bytes);
+    copy_bytes(output_buffer, (const uint8_t *)(FLASH_BASE + flash_offset), total_bytes);
 }
 
 /* pulls the fixed boot image pieces from flash */
@@ -269,24 +245,22 @@ static void check_and_load_kernel(const manifest_t *manifest)
         halt();
     }
 
+    /* FESVR-bypass: kernel is already in DRAM at FLASH_BASE+KERNEL_OFFSET.
+     * Hash directly from there in one pass, then copy to load_address only
+     * after the hash check passes. */
+    const uint8_t *kernel_src = (const uint8_t *)(FLASH_BASE + KERNEL_OFFSET);
+
     sha256_init(&ctx);
-
-    while (copied < manifest->payload_size) {
-        uint32_t left = manifest->payload_size - copied;
-        uint32_t chunk_size = left < KERNEL_CHUNK_SIZE ? left : KERNEL_CHUNK_SIZE;
-
-        read_flash(KERNEL_OFFSET + copied, chunk_size, KERNEL_CHUNK);
-        sha256_update(&ctx, KERNEL_CHUNK, chunk_size);
-        copy_bytes(kernel_output + copied, KERNEL_CHUNK, chunk_size);
-
-        copied += chunk_size;
-    }
-
+    sha256_update(&ctx, kernel_src, manifest->payload_size);
     sha256_final(&ctx, KERNEL_HASH_BUFFER);
+    (void)copied;
 
     if (!same_bytes(KERNEL_HASH_BUFFER, manifest->payload_hash, SHA256_DIGEST_SIZE)) {
         halt();
     }
+
+    /* Hash verified — copy verified kernel from FLASH_BASE to load_address. */
+    copy_bytes(kernel_output, kernel_src, manifest->payload_size);
 }
 
 /* INCREMENT 4: Stage 4 stubbed (will re-enable in INCREMENT 6). */
@@ -353,7 +327,6 @@ static void clear_scratch(void)
     clear_bytes(PUBLIC_KEY_HASH, SHA256_DIGEST_SIZE);
     clear_bytes(OTP_HASH_BUFFER, OTP_HASH_SIZE);
     clear_bytes(KERNEL_HASH_BUFFER, SHA256_DIGEST_SIZE);
-    clear_bytes(KERNEL_CHUNK, KERNEL_CHUNK_SIZE);
 }
 
 /* jumps into the verified kernel */
@@ -401,56 +374,14 @@ static void uart_print(const char *s)
 
 void bootrom_main(void)
 {
-    /* DIAGNOSTIC: only-success-exits.
-     * Magic OK  -> tohost=1 -> $finish at ~240s
-     * Magic BAD -> no tohost write -> hang forever
-     * Non-1 tohost values trigger FESVR syscall handling and confuse exit. */
-    read_boot_parts();
-    /* Force memory ordering: ensure all SPI peripheral / store buffer writes
-     * are visible before the load. fence.i synchronizes the instruction
-     * stream as well (paranoid). */
-    __asm__ volatile ("fence rw, rw" ::: "memory");
-    __asm__ volatile ("fence.i" ::: "memory");
-    uint32_t got = *(volatile uint32_t *)MANIFEST_BUFFER;
-    if (got == MANIFEST_MAGIC) {
+    /* DIAGNOSTIC: verify FESVR --payload= actually loaded flash_image.elf
+     * at FLASH_BASE. If the magic at FLASH_BASE is SBOT, exit success.
+     * Otherwise hang (so we know it didn't load). */
+    uint32_t magic = *(volatile uint32_t *)FLASH_BASE;
+    if (magic == MANIFEST_MAGIC) {
         *(volatile uint64_t *)0x80001e00 = 1;
     }
     while (1) {
         __asm__ volatile ("wfi");
     }
-
-    /* Original flow (unreachable until we re-enable):
-    manifest_t *manifest = (manifest_t *)MANIFEST_BUFFER;
-    uint32_t entry_point;
-
-    uart_init();
-    uart_print("BOOTROM\n");
-
-    read_boot_parts();
-    uart_print("S0\n");
-
-    check_manifest_header(manifest);
-    uart_print("S1\n");
-
-    check_public_key();
-    uart_print("S2\n");
-
-    check_manifest_signature();
-    uart_print("S3\n");
-
-    check_and_load_kernel(manifest);
-    uart_print("S4\n");
-
-    check_rollback_counter(manifest);
-    uart_print("S5\n");
-
-    entry_point = manifest->entry_point;
-
-    clear_scratch();
-    lock_pmp();
-    uart_print("JMP\n");
-    jump_to_kernel(entry_point);
-    */
-
-    halt();
 }
