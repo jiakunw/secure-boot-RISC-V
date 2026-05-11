@@ -64,6 +64,21 @@ else
     echo "  (No Chisel sources yet, skipping)"
 fi
 
+# Stage SystemVerilog blackbox sources into Chipyard's resources/vsrc/.
+# `HasBlackBoxResource + addResource("/vsrc/Foo.sv")` resolves files via the
+# chipyard generator's classpath resources, which is rooted here.
+VSRC_OUT_DIR=$CHIPYARD/generators/chipyard/src/main/resources/vsrc
+SV_SOURCES=$(find "$MYREPO/hardware" -path "*/tb/*" -prune -o \( -name "*.sv" -o -name "*.v" \) -type f -print | grep -v '^$' || true)
+
+if [ -n "$SV_SOURCES" ]; then
+    mkdir -p "$VSRC_OUT_DIR"
+    while IFS= read -r src; do
+        [ -z "$src" ] && continue
+        ln -sf "$src" "$VSRC_OUT_DIR/"
+        echo "  Linked $(basename "$src") -> resources/vsrc/"
+    done <<< "$SV_SOURCES"
+fi
+
 echo ""
 echo "[1b/5] Preparing flash image hex..."
 if [ -f "$MYREPO/tools/flash_image_to_hex.py" ] && [ -f "$MYREPO/flash_image/flash_image.bin" ]; then
