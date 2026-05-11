@@ -1,8 +1,8 @@
 package chipyard
 
 import chisel3._
+import chisel3.experimental.{IntParam, StringParam}
 import chisel3.util._
-import chisel3.util.experimental.loadMemoryFromFileInline
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.prci._
 import freechips.rocketchip.regmapper.RegField
@@ -25,6 +25,26 @@ class SecureBootSPIPort extends Bundle {
   val miso = Input(Bool())
 }
 
+// SV implementation lives in hardware/spi_flash/vsrc/FlashStorage.sv and is
+// staged into Chipyard's resources/vsrc/ tree by integrate_to_chipyard.sh.
+// We sidestep Chisel `Mem` entirely so FIRRTL never emits the
+// `RANDOMIZE_MEM_INIT` overwrite that would clobber our $readmemh.
+class FlashStorage(depthBytes: Int, hexFile: String) extends BlackBox(Map(
+  "DEPTH"    -> IntParam(depthBytes),
+  "ADDR_W"   -> IntParam(log2Ceil(depthBytes)),
+  "HEX_FILE" -> StringParam(hexFile)
+)) with HasBlackBoxResource {
+  private val addrW = log2Ceil(depthBytes)
+  val io = IO(new Bundle {
+    val addr0 = Input(UInt(addrW.W))
+    val data0 = Output(UInt(8.W))
+    val addr1 = Input(UInt(addrW.W))
+    val data1 = Output(UInt(8.W))
+  })
+
+  addResource("/vsrc/FlashStorage.sv")
+}
+
 class SPIFlashSlave(
     depthBytes: Int = 1 << 20,
     imageHexFile: String = ""
@@ -42,10 +62,7 @@ class SPIFlashSlave(
     val readAddress = Output(UInt(24.W))
   })
 
-  val flash = Mem(depthBytes, UInt(8.W))
-  if (imageHexFile.nonEmpty) {
-    loadMemoryFromFileInline(flash, imageHexFile)
-  }
+  val flashMem = Module(new FlashStorage(depthBytes, imageHexFile))
 
   val sIdle :: sCommand :: sAddress :: sData :: sIgnore :: Nil = Enum(5)
 
@@ -63,9 +80,14 @@ class SPIFlashSlave(
   val outputLoaded = RegInit(false.B)
   val misoReg = RegInit(false.B)
 
-  private def readByte(addr: UInt): UInt = flash(addr(addrWidth - 1, 0))
   private def nextAddress(addr: UInt): UInt =
     Mux(addr === (depthBytes - 1).U, 0.U, addr + 1.U)
+
+  // Combinational reads from the hand-written flash storage BlackBox.
+  // Port 0 serves the sAddress -> sData hand-off (first byte at the freshly
+  // assembled 24-bit address); port 1 serves the byte-rollover inside sData.
+  flashMem.io.addr0 := Cat(addressReg(22, 0), io.mosi)(addrWidth - 1, 0)
+  flashMem.io.addr1 := nextAddress(addressReg)(addrWidth - 1, 0)
 
   io.miso := Mux(io.cs_n, false.B, misoReg)
   io.active := !io.cs_n && state =/= sIdle
@@ -106,7 +128,7 @@ class SPIFlashSlave(
           addressReg := nextAddr
           when(addressBits === 23.U) {
             addressBits := 0.U
-            outputReg := readByte(nextAddr)
+            outputReg := flashMem.io.data0
             outputBits := 0.U
             outputLoaded := false.B
             state := sData
@@ -124,7 +146,7 @@ class SPIFlashSlave(
           }.otherwise {
             when(outputBits === 7.U) {
               val addrPlusOne = nextAddress(addressReg)
-              val nextByte = readByte(addrPlusOne)
+              val nextByte = flashMem.io.data1
               addressReg := addrPlusOne
               outputReg := nextByte
               misoReg := nextByte(7)

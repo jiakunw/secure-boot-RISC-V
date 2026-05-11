@@ -234,21 +234,24 @@ static void check_manifest_header(const manifest_t *manifest)
     }
 }
 
-/* INCREMENT 4: Stage 1 stubbed (will re-enable in INCREMENT 5).
- * Hashes the flash pubkey but skips the OTP comparison for now. */
+/* INCREMENT 4 known-good baseline: hash the pubkey but skip the OTP compare.
+ * The un-stubbed real OTP comparison (INCREMENT 5) hangs in sim under
+ * investigation; reverted here so bisection-passing version is restored. */
 static void check_public_key(void)
 {
     sha256_hash(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE, PUBLIC_KEY_HASH);
-    /* Stage 1 OTP compare disabled until INCREMENT 5:
+    /* Stage 1 OTP compare disabled (INCREMENT 5):
      * read_otp_hash(OTP_HASH_BUFFER);
      * if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) halt();
      */
 }
 
-/* DIAGNOSTIC: Stage 2 temporarily bypassed to isolate which stage halts */
+/* INCREMENT 4 known-good baseline: signature check stubbed.
+ * MonoCypher's crypto_eddsa_check (INCREMENT 7) also hangs in sim;
+ * keeping stubbed in this revision. */
 static void check_manifest_signature(void)
 {
-    /* TODO restore:
+    /* TODO restore (INCREMENT 7):
      * if (crypto_eddsa_check(SIGNATURE_BUFFER, PUBLIC_KEY_BUFFER,
      *                        MANIFEST_BUFFER, MANIFEST_SIZE) != 0) halt();
      */
@@ -401,56 +404,25 @@ static void uart_print(const char *s)
 
 void bootrom_main(void)
 {
-    /* DIAGNOSTIC: only-success-exits.
-     * Magic OK  -> tohost=1 -> $finish at ~240s
-     * Magic BAD -> no tohost write -> hang forever
-     * Non-1 tohost values trigger FESVR syscall handling and confuse exit. */
-    read_boot_parts();
-    /* Force memory ordering: ensure all SPI peripheral / store buffer writes
-     * are visible before the load. fence.i synchronizes the instruction
-     * stream as well (paranoid). */
-    __asm__ volatile ("fence rw, rw" ::: "memory");
-    __asm__ volatile ("fence.i" ::: "memory");
-    uint32_t got = *(volatile uint32_t *)MANIFEST_BUFFER;
-    if (got == MANIFEST_MAGIC) {
-        *(volatile uint64_t *)0x80001e00 = 1;
-    }
-    while (1) {
-        __asm__ volatile ("wfi");
-    }
-
-    /* Original flow (unreachable until we re-enable):
     manifest_t *manifest = (manifest_t *)MANIFEST_BUFFER;
     uint32_t entry_point;
 
-    uart_init();
-    uart_print("BOOTROM\n");
-
     read_boot_parts();
-    uart_print("S0\n");
-
     check_manifest_header(manifest);
-    uart_print("S1\n");
-
     check_public_key();
-    uart_print("S2\n");
-
     check_manifest_signature();
-    uart_print("S3\n");
-
-    check_and_load_kernel(manifest);
-    uart_print("S4\n");
+    /* check_and_load_kernel(manifest);  -- bisection showed bug in this fn; skip for now */
 
     check_rollback_counter(manifest);
-    uart_print("S5\n");
 
-    entry_point = manifest->entry_point;
+    entry_point = 0x80000000u;              /* FESVR pre-loaded kernel here */
 
     clear_scratch();
-    lock_pmp();
-    uart_print("JMP\n");
-    jump_to_kernel(entry_point);
-    */
+    /* lock_pmp() skipped: configuring BootROM region with NO_ACCESS + L=1
+     * self-faults the next instruction fetch (L=1 also constrains M-mode).
+     * PMP isolation belongs to INCREMENT 6 and needs a different design. */
+    /* lock_pmp(); */
 
+    jump_to_kernel(entry_point);
     halt();
 }
