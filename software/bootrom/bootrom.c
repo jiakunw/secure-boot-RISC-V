@@ -82,6 +82,32 @@ static void halt(void)
     }
 }
 
+/* Recovery firmware entry point. Lives at 0x80100000 in DRAM and is loaded
+ * by FESVR from a separately-built ELF (software/recovery/recovery.riscv).
+ * This emulates the production secure-boot pattern where verification
+ * failure hands control to a signed recovery image that lives in its own
+ * flash partition. */
+#define RECOVERY_ENTRY 0x80100000UL
+
+/* On verification failure, mret to the recovery image instead of halting.
+ * No-return: control never comes back. */
+static __attribute__((noreturn)) void enter_recovery(void)
+{
+    __asm__ volatile (
+        "fence\n"
+        "fence.i\n"
+        "li t0, %0\n"
+        "csrw mepc, t0\n"
+        "csrr a0, mhartid\n"
+        "li a1, 0\n"
+        "mret\n"
+        :
+        : "i"(RECOVERY_ENTRY)
+        : "t0", "a0", "a1", "memory"
+    );
+    while (1) { }
+}
+
 /* freestanding memset / memcpy for MonoCypher under -nostdlib; volatile pointers
  * prevent GCC from replacing the loop with a self-recursive call to memset */
 void *memset(void *dst, int value, size_t total_bytes)
@@ -222,28 +248,30 @@ static void read_otp_hash(uint8_t *output_buffer)
     }
 }
 
-/* checks that the manifest starts with the right marker */
+/* Stage 0: manifest magic + header version. Mismatch = boot image not for
+ * us or actively replaced -> hand off to recovery firmware. */
 static void check_manifest_header(const manifest_t *manifest)
 {
     if (manifest->magic != MANIFEST_MAGIC) {
-        halt();
+        enter_recovery();
     }
 
     if (manifest->header_version != MANIFEST_HEADER_VERSION) {
-        halt();
+        enter_recovery();
     }
 }
 
-/* INCREMENT 4 known-good baseline: hash the pubkey but skip the OTP compare.
- * The un-stubbed real OTP comparison (INCREMENT 5) hangs in sim under
- * investigation; reverted here so bisection-passing version is restored. */
+/* Stage 1: hash the flash-resident public key with SHA-256 and compare
+ * against the hash burned into OTP at manufacturing. OTP is the hardware
+ * root of trust — a mismatch is a strong tampering signal. On mismatch
+ * we hand off to the recovery firmware (loaded at 0x80100000). */
 static void check_public_key(void)
 {
     sha256_hash(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE, PUBLIC_KEY_HASH);
-    /* Stage 1 OTP compare disabled (INCREMENT 5):
-     * read_otp_hash(OTP_HASH_BUFFER);
-     * if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) halt();
-     */
+    read_otp_hash(OTP_HASH_BUFFER);
+    if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) {
+        enter_recovery();
+    }
 }
 
 /* INCREMENT 4 known-good baseline: signature check stubbed.

@@ -145,22 +145,26 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# 3. Copy kernel sources
+# 3. Copy kernel + recovery sources
 # ─────────────────────────────────────────────
 echo ""
-echo "[3/5] Copying kernel sources to Chipyard tests..."
+echo "[3/5] Copying kernel + recovery sources to Chipyard tests..."
 if ls $MYREPO/software/kernel/*.c 1> /dev/null 2>&1; then
     cp $MYREPO/software/kernel/*.c   $TESTS_DIR/ 2>/dev/null || true
     cp $MYREPO/software/kernel/*.h   $TESTS_DIR/ 2>/dev/null || true
-    echo "  Done."
+    echo "  Copied kernel source(s)."
 else
-    echo "  (No kernel sources, skipping kernel build)"
+    echo "  (No kernel sources, skipping kernel/recovery build)"
     echo ""
     echo "Done (BootROM + Chisel only). Run:"
     echo "  cd $CHIPYARD/sims/verilator"
     echo "  make CONFIG=SecureBootConfig"
     exit 0
 fi
+
+## Recovery firmware is built standalone via its own Makefile below (not
+## copied into Chipyard's tests dir; it needs a custom linker script that
+## conflicts with Chipyard's global -T htif.ld).
 
 # ─────────────────────────────────────────────
 # 4. Patch CMakeLists.txt (idempotent)
@@ -179,14 +183,18 @@ add_dump_target(kernel)
 EOF
     echo "  Added 'kernel' target."
 else
-    echo "  Already patched."
+    echo "  Already patched (kernel)."
 fi
 
+## (Recovery target intentionally not added to Chipyard's CMakeLists.txt
+## because the global -T htif.ld there conflicts with recovery.ld.
+## Recovery is built standalone via its own Makefile below.)
+
 # ─────────────────────────────────────────────
-# 5. Build kernel via cmake
+# 5. Build kernel + recovery via cmake
 # ─────────────────────────────────────────────
 echo ""
-echo "[5/5] Building kernel..."
+echo "[5/5] Building kernel + recovery..."
 
 mkdir -p "$TESTS_DIR/build"
 
@@ -202,13 +210,33 @@ KERNEL_REPO_DIR="$MYREPO/software/kernel"
 if [ -f "$ELF_PATH" ]; then
     echo "  Extracting kernel.bin..."
     riscv64-unknown-elf-objcopy -O binary "$ELF_PATH" "$BIN_PATH"
-    
+
     cp "$ELF_PATH" "$KERNEL_REPO_DIR/"
     cp "$BIN_PATH" "$KERNEL_REPO_DIR/"
     echo "  Success: kernel.riscv + kernel.bin copied to $KERNEL_REPO_DIR/"
 else
     echo "  Error: kernel.riscv was not built successfully"
     exit 1
+fi
+
+# Build recovery firmware standalone via its own Makefile (custom linker
+# script recovery.ld placing it at 0x80100000).
+if [ -f "$MYREPO/software/recovery/Makefile" ]; then
+    echo "  Building recovery firmware..."
+    cd "$MYREPO/software/recovery"
+    make clean >/dev/null 2>&1 || true
+    if make 2>&1 | tail -3; then
+        if [ -f "recovery.riscv" ]; then
+            echo "  Success: recovery.riscv built (linked at 0x80100000)"
+            echo "    Size: $(stat -c%s recovery.riscv) bytes"
+        else
+            echo "  Error: recovery.riscv was not produced"
+            exit 1
+        fi
+    else
+        echo "  Error building recovery firmware"
+        exit 1
+    fi
 fi
 
 # ─────────────────────────────────────────────
@@ -224,7 +252,10 @@ echo "  cd $CHIPYARD/sims/verilator"
 echo "  make CONFIG=RocketConfig"
 echo "  ./simulator-chipyard.harness-RocketConfig $KERNEL_REPO_DIR/kernel.riscv"
 echo ""
-echo "To run with your secure boot config:"
+echo "To run with your secure boot config (pass BOTH ELFs so FESVR loads"
+echo "kernel @ 0x80000000 and recovery @ 0x80100000):"
 echo "  cd $CHIPYARD/sims/verilator"
 echo "  make CONFIG=SecureBootConfig"
-echo "  ./simulator-chipyard.harness-SecureBootConfig $KERNEL_REPO_DIR/kernel.riscv"
+echo "  ./simulator-chipyard.harness-SecureBootConfig \\"
+echo "      $KERNEL_REPO_DIR/kernel.riscv \\"
+echo "      $MYREPO/software/recovery/recovery.riscv"
