@@ -377,31 +377,6 @@ static void jump_to_kernel(uint32_t entry_point)
     halt();
 }
 
-/* DEBUG: SiFive UART at 0x10020000. txdata bit 31 = full, txctrl bit 0 = enable */
-#define UART_BASE   0x10020000UL
-#define UART_TXDATA (UART_BASE + 0x00)
-#define UART_TXCTRL (UART_BASE + 0x08)
-#define UART_DIV    (UART_BASE + 0x18)
-
-static void uart_init(void)
-{
-    *(volatile uint32_t *)UART_DIV    = 0;   /* simulation: no divider needed */
-    *(volatile uint32_t *)UART_TXCTRL = 1;   /* enable TX */
-}
-
-static void uart_putc(char c)
-{
-    while (*(volatile uint32_t *)UART_TXDATA & 0x80000000u) { }
-    *(volatile uint32_t *)UART_TXDATA = (uint8_t)c;
-}
-
-static void uart_print(const char *s)
-{
-    while (*s) {
-        uart_putc(*s++);
-    }
-}
-
 void bootrom_main(void)
 {
     manifest_t *manifest = (manifest_t *)MANIFEST_BUFFER;
