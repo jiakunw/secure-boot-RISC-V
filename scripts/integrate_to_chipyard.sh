@@ -93,7 +93,7 @@ else
 fi
 
 echo ""
-echo "[1c/5] Patching Chipyard DigitalTop for secure boot peripherals (OTP + Rollback + SPI)..."
+echo "[1c/5] Patching Chipyard DigitalTop for secure boot peripherals (OTP + Rollback + SPI + Status Register)..."
 DIGITAL_TOP=$CHIPYARD/generators/chipyard/src/main/scala/DigitalTop.scala
 if [ -f "$DIGITAL_TOP" ]; then
     if ! grep -q "CanHavePeripherySecureBootOTP" "$DIGITAL_TOP"; then
@@ -115,6 +115,13 @@ if [ -f "$DIGITAL_TOP" ]; then
         echo "  Added CanHavePeripherySecureBootSPI to DigitalTop."
     else
         echo "  CanHavePeripherySecureBootSPI already patched."
+    fi
+
+    if ! grep -q "CanHavePeripherySecureBootSR" "$DIGITAL_TOP"; then
+        sed -i.bak '/with chipyard.example.CanHavePeripheryGCD/i\  with chipyard.CanHavePeripherySecureBootSR // Boot-status register: which verification stage failed' "$DIGITAL_TOP"
+        echo "  Added CanHavePeripherySecureBootSR to DigitalTop."
+    else
+        echo "  CanHavePeripherySecureBootSR already patched."
     fi
 else
     echo "  Warning: DigitalTop.scala not found; secure boot peripherals will not instantiate."

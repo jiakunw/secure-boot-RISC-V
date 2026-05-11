@@ -46,6 +46,9 @@ hardware/
   spi_flash/
     rtl/spi_flash.scala     SPI master + simulated slave + TL adapter
     vsrc/FlashStorage.sv    Hand-written SV blackbox for flash storage
+  status_register/rtl/      Boot-status register (32-bit) at 0xF0003000;
+                            BootROM sets one bit per failed stage,
+                            recovery reads to report root cause.
   secureboot/
     SecureBootConfig.scala  Top-level config (peripherals + BootROM override)
 software/
@@ -66,6 +69,14 @@ flash_image/
 tools/                      Python signing + image-assembly tools
 scripts/
   integrate_to_chipyard.sh  Symlinks Scala + SV into Chipyard, builds artifacts
+tests/
+  test_tempering_manifest_header/   Self-contained "tempered SoC" negative test:
+    TemperedSecureBootConfig.scala  alt config pointing SPI flash at tampered hex
+    tools/                          tampered manifest_generators.py + sign_firmware.py
+    tempered_flash_image/           generated tampered artifacts
+    build.sh + run.sh               build alt sim binary + verify recovery handoff
+  test_tempering_public_key/        (byte-tamper variant, simpler)
+  run_all.sh                        master runner
 ```
 
 ---
@@ -163,16 +174,19 @@ Stage 5: ┌──────────────────────�
 | 2 | SPI Flash master + simulated slave + TL adapter | ✅ done | MMIO `0xF0002000` |
 | 3 | Baseline build pipeline (BootROM → integrate → Verilator → sim) | ✅ done | |
 | **4** | **Full 6-stage BootROM runs end-to-end, stages 2/4 stubbed** | **🚧 5/6 stages** | Bisection-confirmed: `check_and_load_kernel` (Stage 3) hangs |
-| **5** | **Real OTP compare in Stage 1 (`check_public_key`)** | **✅ done** | Debug dropbox confirmed `MATCH` between BootROM-computed SHA-256(pubkey) and OTP-burned hash; now wired so a mismatch jumps to recovery firmware |
-| 6 | Real rollback counter check + PMP lock | ⏳ pending | `lock_pmp` design needs rework (see below) |
+| **5** | **Real OTP compare in Stage 1 (`check_public_key`)** | **✅ done** | Debug dropbox confirmed `MATCH` between BootROM-computed SHA-256(pubkey) and OTP-burned hash; mismatch triggers `enter_recovery(SR_PUBLIC_KEY)` (bit 1) |
+| **6** | **PMP lock (Stage 5) — real lock active; rollback still stub** | **🚧 PMP only** | `lock_pmp` now writes BootROM=RX+L, OTP/Counter=NO_ACCESS+L, catch-all=RWX+L; BootROM successfully `mret`s to kernel post-lock. Rollback counter check is still stubbed |
 | 7 | Real Ed25519 verify (MonoCypher) in Stage 2 | 🔧 attempted, hangs | Un-stubbed code hangs in sim; previously suspected MonoCypher / OTP but earlier hangs may have been zombie-sim CPU starvation — needs re-test |
-| **+** | **Recovery handler (industry-style failure handoff)** | **✅ done** | Separate `recovery.riscv` ELF at `0x80100000`; BootROM mret's to it on `check_manifest_header` / `check_public_key` failure instead of halting forever |
+| **+** | **Recovery handler (industry-style failure handoff)** | **✅ done** | Separate `recovery.riscv` ELF at `0x80100000`; `enter_recovery(reason_bit)` writes the failing-stage bit to the SR, sets `mtvec=RECOVERY_ENTRY`, and `mret`s to recovery on `check_manifest_header` / `check_public_key` failure (and `check_and_load_kernel` failure when re-enabled) |
+| **+** | **Status Register (SR) peripheral — 32-bit boot-status MMIO** | **✅ done** | New peripheral at `0xF0003000` (`hardware/status_register/rtl/sr.scala`). BootROM sets one bit per failed stage (`SR_MANIFEST_HEADER`=0x01, `SR_PUBLIC_KEY`=0x02, …, `SR_LOCK_PMP`=0x20); recovery reads and reports which stage failed |
+| **+** | **Tempered SoC test infrastructure (negative tests)** | **✅ done** | `tests/test_tempering_manifest_header/` builds an entire parallel SoC (`TemperedSecureBootConfig`) that points the SPI flash at a deliberately-tampered hex image. Verified: Stage 0 catches the bad magic, kernel banner absent (PASS weak) |
 
 **Currently shipped (this commit):**
-- Stages 0, 1 (full — SHA-256 + OTP compare), 2 (stub), 4 (stub), 5 (clear_scratch only, no PMP lock) all run.
-- Stage 3 (`check_and_load_kernel`) is commented out — BootROM mret's to FESVR-pre-loaded kernel at 0x80000000.
-- Verification failures in Stage 0 or Stage 1 trigger `enter_recovery()` instead of halting; CPU `mret`s to recovery firmware at 0x80100000.
-- Kernel boots successfully and prints `kernel started successfully rocket` on the happy path.
+- All BootROM stages 0, 1, 2, 4, 5 run end-to-end on the happy path (signature + rollback are stubs but the function bodies execute and return).
+- Stage 3 (`check_and_load_kernel`) is still commented out — bisection confirmed the SPI multi-transaction hang.
+- **PMP lock is now active**: BootROM region locked R+X (M-mode can still execute remaining instructions), OTP / Counter regions NO_ACCESS (kernel cannot read them post-lock), catch-all RWX. Kernel boots in M-mode but is isolated from the OTP root-of-trust and the rollback counter.
+- Verification failures in Stages 0, 1, 3, 5 trigger `enter_recovery(reason_bit)` which writes the failing-stage bit into the SR and `mret`s to the recovery firmware at `0x80100000`.
+- **Happy path verified end-to-end**: with all integrated stages (real OTP compare + real PMP lock active), the kernel still boots and prints `kernel started successfully rocket` cleanly.
 
 ---
 
@@ -192,16 +206,42 @@ Stage 5: ┌──────────────────────�
    ```
    Both buffers identical and match `metadata/pubkey_hash.bin`. The compare is now wired with `enter_recovery()` on mismatch (tampering triggers recovery handoff rather than silent boot).
 
-4. **5 of 6 BootROM stages run end-to-end.** Bisection (commenting out `check_and_load_kernel`) showed everything else completes:
+4. **5 of 6 BootROM stages run end-to-end with PMP lock active.** Bisection (commenting out `check_and_load_kernel`) showed everything else completes:
    - read_boot_parts (3 SPI transactions)
    - magic check (real, recovery on mismatch)
    - pubkey SHA-256 + OTP compare (real, recovery on mismatch)
    - signature stub
    - rollback stub
    - clear_scratch
-   - mret to kernel
+   - **`lock_pmp()` — real, with production-style permissions** (see below)
+   - mret to kernel — kernel still boots cleanly in M-mode
 
-5. **Recovery firmware — industry-style failure handoff.** Instead of `halt()` on verification failure, BootROM `mret`s to a separately-built `recovery.riscv` ELF linked at `0x80100000`. This emulates the production pattern used by Apple Recovery OS, Google Titan recovery mode, Android recovery partition, etc.: verification fails → hand off to a recovery image instead of bricking. The recovery image lives in `software/recovery/` with its own linker script (`recovery.ld`) and Makefile (built standalone, bypassing Chipyard's CMake which can't override the global `-T htif.ld`). FESVR loads BOTH `kernel.riscv` and `recovery.riscv` at simulator startup; the BootROM chooses which to `mret` to based on whether verification passes. See [Recovery Handler Design](#recovery-handler-design) below.
+5. **PMP lock (Stage 5) — real and isolating.** `lock_pmp` writes:
+   | Entry | Region | Permissions | Reason |
+   |---|---|---|---|
+   | 0 | BootROM (`0x10000-0x20000`) | `RX + L=1` | M-mode keeps execute (so the post-`lock_pmp` `mret` works); kernel cannot write/execute |
+   | 1 | OTP (`0xF0000000-0xF000001F`) | `NO_ACCESS + L=1` | Kernel cannot read the root-of-trust hash |
+   | 2 | Rollback Counter (`0xF0001000-0xF0001007`) | `NO_ACCESS + L=1` | Kernel cannot fast-forward or read the counter |
+   | 3 | catch-all `0x0..2^54` | `RWX + L=1` | DRAM + remaining MMIO available |
+
+   **Defense in depth**: `lock_pmp` *also* sets `mtvec = RECOVERY_ENTRY` and pre-marks `SR_LOCK_PMP` in the status register before the PMP commit, so if any future change to the PMP config accidentally introduces a self-fault, the trap is caught by the recovery firmware (and the SR shows the cause). On the success path, the function clears `SR_LOCK_PMP` after the commit returns.
+
+   **Initial design used `NO_ACCESS+L=1` for the BootROM region** — that self-faulted the very next instruction fetch because `L=1` extends PMP enforcement to M-mode. The current `RX+L=1` keeps execute permission for M-mode while denying write/execute to S/U-mode kernel.
+
+6. **Status Register (SR) peripheral — boot-failure cause tracking.** New custom peripheral at MMIO `0xF0003000` (`hardware/status_register/rtl/sr.scala`). 32-bit register, one bit per verification stage:
+
+   | Bit | Stage | Macro in `bootrom.c` |
+   |---|---|---|
+   | 0 | `check_manifest_header` | `SR_MANIFEST_HEADER` |
+   | 1 | `check_public_key` | `SR_PUBLIC_KEY` |
+   | 2 | `check_manifest_signature` | `SR_MANIFEST_SIGNATURE` |
+   | 3 | `check_and_load_kernel` | `SR_LOAD_KERNEL` |
+   | 4 | `check_rollback_counter` | `SR_ROLLBACK_COUNTER` |
+   | 5 | `lock_pmp` | `SR_LOCK_PMP` |
+
+   `enter_recovery(reason_bit)` reads-modify-writes the SR so the recovery firmware can decode which stage failed by reading `*(volatile uint32_t *)0xF0003000`.
+
+7. **Recovery firmware — industry-style failure handoff.** Instead of `halt()` on verification failure, BootROM `mret`s to a separately-built `recovery.riscv` ELF linked at `0x80100000`. This emulates the production pattern used by Apple Recovery OS, Google Titan recovery mode, Android recovery partition, etc.: verification fails → hand off to a recovery image instead of bricking. The recovery image lives in `software/recovery/` with its own linker script (`recovery.ld`) and Makefile (built standalone, bypassing Chipyard's CMake which can't override the global `-T htif.ld`). FESVR loads BOTH `kernel.riscv` and `recovery.riscv` at simulator startup; the BootROM chooses which to `mret` to based on whether verification passes. See [Recovery Handler Design](#recovery-handler-design) below.
 
 6. **Build pipeline.** Single `integrate_to_chipyard.sh` invocation rebuilds BootROM (with `-Os --gc-sections`), kernel via cmake, **recovery firmware via its own standalone Makefile**, copies into Chipyard's resource tree, regenerates flash image hex.
 
@@ -293,12 +333,15 @@ Un-stubbing `crypto_eddsa_check()` (MonoCypher Ed25519). Earlier attempts showed
 - An infinite loop in some MonoCypher inner routine
 - **Previous hangs may have been zombie-sim CPU starvation** (we had 17 leaked sims fighting for CPU). After OTP turned out to work fine once zombies were cleaned, Ed25519 deserves a re-test under clean CPU conditions — could plausibly Just Work.
 
-### 3. `lock_pmp()` — self-fault
+### 3. Recovery firmware printf invisible (HTIF tohost mismatch)
 
-Configuring PMP entry 0 to cover the BootROM region with `NO_ACCESS + L=1` makes the *next instruction fetch* (return from `lock_pmp` into the BootROM region we just locked) fault, because the RISC-V spec says `L=1` extends PMP enforcement to M-mode. Currently commented out. INCREMENT 6 needs a different design — either:
-- Configure BootROM as `RX + L=1` instead of `NO_ACCESS + L=1` (keeps execute, locks writes)
-- Copy a tiny trampoline to DRAM and jump there before lock_pmp, so the post-lock fetch is from an unlocked region
-- Drop privilege to S/U mode via `mret` first, then PMP applies and BootROM is naturally unreachable from S/U
+When BootROM `mret`s to the recovery image (e.g., on a tampered manifest), recovery's `_start` runs and calls `printf` for diagnostics. But FESVR scans only the **first** ELF on its command line (`kernel.riscv`) for the `tohost`/`fromhost` symbols. `recovery.riscv` has its own `.htif` section at its own address, which FESVR isn't watching. Result: recovery runs, but its console output goes nowhere, and the sim never sees the exit syscall → sim hangs forever.
+
+Detected during both the `lock_pmp` self-fault investigation and the tempered negative test. Workaround in tests: rely on **kernel banner absence** (PASS weak) instead of recovery's positive output.
+
+**Fix candidates (untested, INCREMENT-future):**
+- Link recovery with `-Wl,--defsym=tohost=<kernel_tohost_addr>,--defsym=fromhost=<kernel_fromhost_addr>` so both ELFs write to the same HTIF mailbox FESVR is watching.
+- Or have `enter_recovery()` write a magic exit code directly to the (kernel) tohost address before `mret`, so the sim terminates with a known exit code even if recovery's own console is unreachable.
 
 ---
 
@@ -368,17 +411,29 @@ kernel started successfully rocket
 ```
 Both hash buffers identical and match `metadata/pubkey_hash.bin` byte-for-byte. OTP root-of-trust is anchored.
 
-**Current (shipped) state — happy path with recovery handler wired:**
+**Current shipped state — happy path with real OTP compare + real PMP lock:**
 ```
+[UART] UART0 is here (stdin/stdout).
 kernel started successfully rocket
+- TestDriver.v:158: Verilog $finish
 ```
-The OTP compare in `check_public_key` is now real (not a stub) and feeds into `enter_recovery()` on mismatch. `recovery.riscv` is FESVR-loaded at 0x80100000 and will run on any failure of Stage 0 or Stage 1.
+End-to-end clean: BootROM runs Stages 0 (magic), 1 (real OTP compare), 2 (stub), 4 (stub), 5 (clear_scratch + **real PMP lock**), then `mret`s to kernel. Kernel runs in M-mode with PMP isolating it from OTP and the rollback counter, prints success, exits via HTIF.
+
+**Negative test — tampered manifest header (`tests/test_tempering_manifest_header/`):**
+```
+[UART] UART0 is here (stdin/stdout).
+─────────────────────────────────────────
+PASS (weak): kernel banner absent — BootROM did not reach the success
+path. Recovery printf not visible (HTIF tohost-mismatch between
+kernel.riscv and recovery.riscv ELFs).
+```
+A separate `TemperedSecureBootConfig` SoC was built with the SPI flash parameterized to read a manifest whose magic byte was flipped from `'SOBT'` to `'DEAD'`. The BootROM correctly refused to boot the tampered image (Stage 0 caught it and called `enter_recovery(SR_MANIFEST_HEADER)`). Strong verification of recovery output is blocked by the HTIF tohost mismatch (see "What Doesn't Work" #3).
 
 ---
 
 ## TODO (in priority order)
 
-1. **Negative test the recovery path** — corrupt one byte of `metadata/public_key.bin`, regenerate flash hex, re-run sim. Should see `"something went wrong, in recovery mode"` (from recovery.riscv) instead of the kernel banner. Proves the `enter_recovery()` handoff actually fires in the failure case.
+1. **Fix HTIF tohost mismatch** — link recovery.riscv with `--defsym=tohost=<kernel_tohost>` so recovery's printf is actually visible to FESVR. Will upgrade negative tests from PASS (weak) → PASS (strong, with positive evidence of recovery output + SR contents).
 2. **Re-test INCREMENT 7 (Ed25519)** — earlier hang may have been zombie-sim contention; clean sim re-test could surprise us by working.
 3. **Fix `check_and_load_kernel`** — likely rewrite as single-shot SPI read + one-shot SHA-256 hash. Critical for any real secure boot.
 4. **Redesign `lock_pmp`** — `RX+L=1` for BootROM region (or trampoline through DRAM).

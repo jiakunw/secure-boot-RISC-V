@@ -18,6 +18,8 @@ class SecureBootConfig extends Config(
   new chipyard.WithSecureBootOTP() ++
   // INCREMENT 3: add Rollback Counter peripheral
   new chipyard.WithSecureBootRollback() ++
+  // Status register: BootROM writes which verification stage failed; recovery firmware reads it
+  new chipyard.WithSecureBootSR() ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.AbstractConfig
 )

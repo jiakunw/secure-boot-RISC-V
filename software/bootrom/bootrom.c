@@ -25,6 +25,16 @@
 
 #define ROLLBACK_COUNTER_BASE 0xF0001000UL
 
+/* Boot status register: BootROM writes which stage failed (one bit per
+ * stage); recovery firmware reads to report root cause. */
+#define BOOT_STATUS_REG       0xF0003000UL
+#define SR_MANIFEST_HEADER    (1u << 0)
+#define SR_PUBLIC_KEY         (1u << 1)
+#define SR_MANIFEST_SIGNATURE (1u << 2)
+#define SR_LOAD_KERNEL        (1u << 3)
+#define SR_ROLLBACK_COUNTER   (1u << 4)
+#define SR_LOCK_PMP           (1u << 5)
+
 #define MANIFEST_OFFSET   0x00000u
 #define SIGNATURE_OFFSET  0x00060u
 #define PUBLIC_KEY_OFFSET 0x000A0u
@@ -57,8 +67,9 @@
 
 #define KERNEL_CHUNK_SIZE 512u
 
-#define PMP_LOCK_NAPOT_NO_ACCESS 0x98u
-#define PMP_LOCK_NAPOT_RWX       0x9Fu
+#define PMP_LOCK_NAPOT_NO_ACCESS 0x98u   /* L=1, NAPOT, ---  */
+#define PMP_LOCK_NAPOT_RX        0x9Du   /* L=1, NAPOT, R-X  (M-mode can execute) */
+#define PMP_LOCK_NAPOT_RWX       0x9Fu   /* L=1, NAPOT, RWX  */
 #define PMP_LOCK_OFF             0x80u
 
 typedef struct __attribute__((packed)) {
@@ -89,10 +100,20 @@ static void halt(void)
  * flash partition. */
 #define RECOVERY_ENTRY 0x80100000UL
 
-/* On verification failure, mret to the recovery image instead of halting.
- * No-return: control never comes back. */
-static __attribute__((noreturn)) void enter_recovery(void)
+/* Read-modify-write the status register so successive failures accumulate
+ * (we set 1 bit per stage; recovery firmware can inspect all of them). */
+static void set_status(uint32_t bit)
 {
+    uint32_t cur = *(volatile uint32_t *)BOOT_STATUS_REG;
+    *(volatile uint32_t *)BOOT_STATUS_REG = cur | bit;
+    __asm__ volatile ("fence rw, rw" ::: "memory");
+}
+
+/* On verification failure, record which stage failed in the SR and mret
+ * to the recovery image. No-return: control never comes back. */
+static __attribute__((noreturn)) void enter_recovery(uint32_t reason_bit)
+{
+    set_status(reason_bit);
     __asm__ volatile (
         "fence\n"
         "fence.i\n"
@@ -253,11 +274,11 @@ static void read_otp_hash(uint8_t *output_buffer)
 static void check_manifest_header(const manifest_t *manifest)
 {
     if (manifest->magic != MANIFEST_MAGIC) {
-        enter_recovery();
+        enter_recovery(SR_MANIFEST_HEADER);
     }
 
     if (manifest->header_version != MANIFEST_HEADER_VERSION) {
-        enter_recovery();
+        enter_recovery(SR_MANIFEST_HEADER);
     }
 }
 
@@ -270,7 +291,7 @@ static void check_public_key(void)
     sha256_hash(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE, PUBLIC_KEY_HASH);
     read_otp_hash(OTP_HASH_BUFFER);
     if (!same_bytes(PUBLIC_KEY_HASH, OTP_HASH_BUFFER, OTP_HASH_SIZE)) {
-        enter_recovery();
+        enter_recovery(SR_PUBLIC_KEY);
     }
 }
 
@@ -285,7 +306,9 @@ static void check_manifest_signature(void)
      */
 }
 
-/* reads the kernel, copies it to ram, and checks its hash */
+/* Stage 3: read the kernel from flash, hash it, copy to DRAM. Currently
+ * NOT called from bootrom_main (multi-transaction SPI bug under
+ * investigation), but logic kept current so it's ready when fixed. */
 static void check_and_load_kernel(const manifest_t *manifest)
 {
     sha256_ctx ctx;
@@ -293,11 +316,11 @@ static void check_and_load_kernel(const manifest_t *manifest)
     uint8_t *kernel_output = (uint8_t *)(uintptr_t)manifest->load_address;
 
     if (manifest->payload_size == 0) {
-        halt();
+        enter_recovery(SR_LOAD_KERNEL);
     }
 
     if ((uintptr_t)kernel_output < DRAM_BASE) {
-        halt();
+        enter_recovery(SR_LOAD_KERNEL);
     }
 
     sha256_init(&ctx);
@@ -316,7 +339,7 @@ static void check_and_load_kernel(const manifest_t *manifest)
     sha256_final(&ctx, KERNEL_HASH_BUFFER);
 
     if (!same_bytes(KERNEL_HASH_BUFFER, manifest->payload_hash, SHA256_DIGEST_SIZE)) {
-        halt();
+        enter_recovery(SR_LOAD_KERNEL);
     }
 }
 
@@ -338,16 +361,49 @@ static uint64_t make_napot(uint64_t base, uint64_t size)
     return (base >> 2) | ((size - 1) >> 3);
 }
 
-/* locks bootrom, otp, counter, and the catch-all rule */
+/* Stage 5: lock OTP / Counter / BootROM via PMP.
+ *
+ * The PMP config below uses NO_ACCESS+L=1 for the BootROM region. RISC-V
+ * spec says L=1 extends PMP enforcement to M-mode, so the very next
+ * instruction fetch (which still comes from the BootROM region we just
+ * locked) will trigger an instruction-access fault.
+ *
+ * Instead of letting that fault loop forever, we PRE-ARM mtvec to point
+ * at the recovery firmware entry. When the fetch faults, the CPU traps
+ * to mtvec → recovery runs. We also pre-mark SR_LOCK_PMP in the status
+ * register so recovery can report exactly which stage caused the trap.
+ */
 static void lock_pmp(void)
 {
+    /* Pre-mark "lock_pmp failure" in SR. Set before the trap-causing
+     * csrw so the recovery image sees it. We can't easily clear it on
+     * the success path because the trap fires before we'd reach a clear
+     * line, but recovery is only invoked on failure anyway. */
+    set_status(SR_LOCK_PMP);
+
+    /* Redirect M-mode traps to the recovery firmware entry point. */
+    __asm__ volatile (
+        "li t0, %0\n"
+        "csrw mtvec, t0\n"
+        :
+        : "i"(RECOVERY_ENTRY)
+        : "t0", "memory"
+    );
+
     uint64_t pmpaddr0 = make_napot(BOOTROM_BASE, BOOTROM_SIZE);
     uint64_t pmpaddr1 = make_napot(OTP_BASE, OTP_SIZE);
     uint64_t pmpaddr2 = make_napot(ROLLBACK_COUNTER_BASE, ROLLBACK_COUNTER_SIZE);
     uint64_t pmpaddr3 = make_napot(0x0ULL, 1ULL << 54);
 
+    /* PMP entry 0: BootROM region — RX (M-mode can still execute the
+     *               remaining BootROM instructions including the mret to
+     *               kernel). Write/exec from S/U-mode denied.
+     * PMP entry 1: OTP — NO_ACCESS for everyone (we don't touch OTP after
+     *               this point; locked from kernel).
+     * PMP entry 2: Rollback counter — NO_ACCESS (likewise).
+     * PMP entry 3: catch-all RWX — kernel + DRAM accessible. */
     uint64_t pmpcfg0 =
-        ((uint64_t)PMP_LOCK_NAPOT_NO_ACCESS << 0)  |
+        ((uint64_t)PMP_LOCK_NAPOT_RX        << 0)  |   /* BootROM: RX */
         ((uint64_t)PMP_LOCK_NAPOT_NO_ACCESS << 8)  |
         ((uint64_t)PMP_LOCK_NAPOT_NO_ACCESS << 16) |
         ((uint64_t)PMP_LOCK_NAPOT_RWX       << 24) |
@@ -373,6 +429,12 @@ static void lock_pmp(void)
 
     __asm__ volatile ("csrw pmpcfg2, %0" :: "r"(pmpcfg2));
     __asm__ volatile ("csrw pmpcfg0, %0" :: "r"(pmpcfg0));
+
+    /* PMP commit succeeded (BootROM entry is RX, so the next fetch is
+     * allowed). Clear the tentative SR_LOCK_PMP bit we set above so the
+     * status register accurately reflects "no failures". */
+    uint32_t cur = *(volatile uint32_t *)BOOT_STATUS_REG;
+    *(volatile uint32_t *)BOOT_STATUS_REG = cur & ~SR_LOCK_PMP;
 }
 
 /* clears scratch data before leaving bootrom */
@@ -421,10 +483,11 @@ void bootrom_main(void)
     entry_point = 0x80000000u;              /* FESVR pre-loaded kernel here */
 
     clear_scratch();
-    /* lock_pmp() skipped: configuring BootROM region with NO_ACCESS + L=1
-     * self-faults the next instruction fetch (L=1 also constrains M-mode).
-     * PMP isolation belongs to INCREMENT 6 and needs a different design. */
-    /* lock_pmp(); */
+    /* lock_pmp will self-fault on the next instruction fetch (we lock the
+     * BootROM region with NO_ACCESS+L=1, and L=1 enforces against M-mode).
+     * lock_pmp now pre-arms mtvec=RECOVERY_ENTRY before writing PMP, so the
+     * fault traps into the recovery firmware instead of looping forever. */
+    lock_pmp();
 
     jump_to_kernel(entry_point);
     halt();
