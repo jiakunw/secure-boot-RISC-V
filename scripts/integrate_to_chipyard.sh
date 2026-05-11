@@ -51,7 +51,10 @@ SCALA_SOURCES=$(find "$MYREPO/hardware" -path "*/tb/*" -prune -o -name "*.scala"
 
 if [ -n "$SCALA_SOURCES" ]; then
     mkdir -p "$SCALA_OUT_DIR"
-    find "$SCALA_OUT_DIR" -maxdepth 1 -type l -delete 2>/dev/null || true
+    # Delete ONLY the symlinks pointing into $MYREPO/hardware/ — preserves
+    # test-suite symlinks (e.g., TemperedSecureBootConfig.scala installed by
+    # tests/*/build.sh, which points into $MYREPO/tests/).
+    find "$SCALA_OUT_DIR" -maxdepth 1 -type l -lname "$MYREPO/hardware/*" -delete 2>/dev/null || true
 
     while IFS= read -r src; do
         ln -sf "$src" "$SCALA_OUT_DIR/"
@@ -259,10 +262,10 @@ echo "  cd $CHIPYARD/sims/verilator"
 echo "  make CONFIG=RocketConfig"
 echo "  ./simulator-chipyard.harness-RocketConfig $KERNEL_REPO_DIR/kernel.riscv"
 echo ""
-echo "To run with your secure boot config (pass BOTH ELFs so FESVR loads"
-echo "kernel @ 0x80000000 and recovery @ 0x80100000):"
+echo "To run with your secure boot config (recovery passed via +payload=,"
+echo "which is FESVR's way to load extra ELFs alongside the primary kernel):"
 echo "  cd $CHIPYARD/sims/verilator"
 echo "  make CONFIG=SecureBootConfig"
 echo "  ./simulator-chipyard.harness-SecureBootConfig \\"
-echo "      $KERNEL_REPO_DIR/kernel.riscv \\"
-echo "      $MYREPO/software/recovery/recovery.riscv"
+echo "      +payload=$MYREPO/software/recovery/recovery.riscv \\"
+echo "      $KERNEL_REPO_DIR/kernel.riscv"

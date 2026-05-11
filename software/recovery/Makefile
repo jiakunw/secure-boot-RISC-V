@@ -14,7 +14,19 @@ OBJDUMP  = riscv64-unknown-elf-objdump
 SPECS      = -specs=htif_nano.specs
 ARCH_FLAGS = -march=rv64imafd -mabi=lp64d -mcmodel=medany
 CFLAGS     = -std=gnu99 -O2 -Wall -Wextra -fno-common -fno-builtin-printf
-LDFLAGS    = -static -T recovery.ld
+
+# CRITICAL: force recovery's tohost/fromhost symbols to land at the SAME
+# addresses kernel.riscv places them at, so FESVR's single tohost-watcher
+# sees recovery's writes too. Without this, recovery's printf/exit are
+# invisible to the host and the sim hangs forever.
+# kernel.riscv addresses come from: riscv64-unknown-elf-nm kernel.riscv | grep -E "tohost|fromhost"
+# (extracted dynamically by build script; hard-coded here as defaults)
+KERNEL_TOHOST   ?= 0x80001e00
+KERNEL_FROMHOST ?= 0x80001e08
+
+LDFLAGS = -static -T recovery.ld \
+          -Wl,--defsym=tohost=$(KERNEL_TOHOST) \
+          -Wl,--defsym=fromhost=$(KERNEL_FROMHOST)
 
 SRC    = recovery.c
 ELF    = recovery.riscv

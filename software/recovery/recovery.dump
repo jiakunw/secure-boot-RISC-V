@@ -2692,12 +2692,12 @@ Disassembly of section .text:
     80101a9e:	ffe5                	bnez	a5,80101a96 <htif_syscall+0x1a>
     80101aa0:	0110000f          	fence	w,w
     80101aa4:	00000697          	auipc	a3,0x0
-    80101aa8:	55c68693          	addi	a3,a3,1372 # 80102000 <tohost>
+    80101aa8:	55c68693          	addi	a3,a3,1372 # 80102000 <__fini_array_end+0x28>
     80101aac:	e290                	sd	a2,0(a3)
     80101aae:	669c                	ld	a5,8(a3)
     80101ab0:	dffd                	beqz	a5,80101aae <htif_syscall+0x32>
     80101ab2:	00000797          	auipc	a5,0x0
-    80101ab6:	5407bb23          	sd	zero,1366(a5) # 80102008 <fromhost>
+    80101ab6:	5407bb23          	sd	zero,1366(a5) # 80102008 <__fini_array_end+0x30>
     80101aba:	0a07202f          	amoswap.w.rl	zero,zero,(a4)
     80101abe:	0220000f          	fence	r,r
     80101ac2:	6502                	ld	a0,0(sp)
@@ -2710,10 +2710,10 @@ Disassembly of section .text:
     80101ad0:	2781                	sext.w	a5,a5
     80101ad2:	07c2                	slli	a5,a5,0x10
     80101ad4:	83c1                	srli	a5,a5,0x10
-    80101ad6:	00000717          	auipc	a4,0x0
-    80101ada:	52a70713          	addi	a4,a4,1322 # 80102000 <tohost>
-    80101ade:	00000697          	auipc	a3,0x0
-    80101ae2:	5206b523          	sd	zero,1322(a3) # 80102008 <fromhost>
+    80101ad6:	fff00717          	auipc	a4,0xfff00
+    80101ada:	32a70713          	addi	a4,a4,810 # 80001e00 <tohost>
+    80101ade:	fff00697          	auipc	a3,0xfff00
+    80101ae2:	3206b523          	sd	zero,810(a3) # 80001e08 <fromhost>
     80101ae6:	e31c                	sd	a5,0(a4)
     80101ae8:	bfdd                	j	80101ade <_exit+0x16>
 

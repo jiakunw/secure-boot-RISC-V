@@ -109,24 +109,44 @@ static void set_status(uint32_t bit)
     __asm__ volatile ("fence rw, rw" ::: "memory");
 }
 
-/* On verification failure, record which stage failed in the SR and mret
- * to the recovery image. No-return: control never comes back. */
+/* Kernel's HTIF `tohost` symbol address (from
+ *   `riscv64-unknown-elf-nm software/kernel/kernel.riscv | grep tohost`).
+ * FESVR polls this address; writing `(code << 1) | 1` here tells FESVR
+ * to call $finish with exit code `code`. We use this as a fail-safe so
+ * the sim ALWAYS exits cleanly on verification failure — even if the
+ * recovery image isn't reachable (e.g., FESVR didn't load it via
+ * `+payload=`, or recovery's own console is unreachable). */
+#define KERNEL_TOHOST_ADDR 0x80001e00UL
+
+/* On verification failure: record which stage failed in the SR, then
+ * signal FESVR to exit by writing tohost in a loop (mimicking the exact
+ * pattern in `_exit` from riscv-pk's htif_nano runtime, which is what
+ * kernel.riscv uses when its main returns).
+ *
+ * Why a loop and not a single write? FESVR polls the simulated DRAM via
+ * a path that doesn't snoop the CPU's L1 D-cache in real time. A single
+ * `sd` to tohost sits dirty in L1 D$ and FESVR sees stale zero forever.
+ * The kernel's _exit loops `*fromhost=0; *tohost=exit_val;` indefinitely
+ * — the repeated writes create cache pressure that eventually evicts the
+ * tohost line to DRAM, where FESVR sees it and calls $finish.
+ *
+ * Exit code encoding: tohost = (exit_code << 1) | 1. With reason_bit as
+ * the exit code, the host-visible exit status is the SR bit number, so
+ * `echo $?` after the sim tells you which stage failed.
+ *
+ * No-return: FESVR's $finish terminates the simulator inside this loop. */
 static __attribute__((noreturn)) void enter_recovery(uint32_t reason_bit)
 {
     set_status(reason_bit);
-    __asm__ volatile (
-        "fence\n"
-        "fence.i\n"
-        "li t0, %0\n"
-        "csrw mepc, t0\n"
-        "csrr a0, mhartid\n"
-        "li a1, 0\n"
-        "mret\n"
-        :
-        : "i"(RECOVERY_ENTRY)
-        : "t0", "a0", "a1", "memory"
-    );
-    while (1) { }
+
+    volatile uint64_t *tohost   = (volatile uint64_t *)KERNEL_TOHOST_ADDR;
+    volatile uint64_t *fromhost = (volatile uint64_t *)(KERNEL_TOHOST_ADDR + 8);
+    uint64_t exit_val = ((uint64_t)reason_bit << 1) | 1ULL;
+
+    for (;;) {
+        *fromhost = 0;
+        *tohost   = exit_val;
+    }
 }
 
 /* freestanding memset / memcpy for MonoCypher under -nostdlib; volatile pointers

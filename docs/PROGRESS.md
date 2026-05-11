@@ -177,16 +177,17 @@ Stage 5: ┌──────────────────────�
 | **5** | **Real OTP compare in Stage 1 (`check_public_key`)** | **✅ done** | Debug dropbox confirmed `MATCH` between BootROM-computed SHA-256(pubkey) and OTP-burned hash; mismatch triggers `enter_recovery(SR_PUBLIC_KEY)` (bit 1) |
 | **6** | **PMP lock (Stage 5) — real lock active; rollback still stub** | **🚧 PMP only** | `lock_pmp` now writes BootROM=RX+L, OTP/Counter=NO_ACCESS+L, catch-all=RWX+L; BootROM successfully `mret`s to kernel post-lock. Rollback counter check is still stubbed |
 | 7 | Real Ed25519 verify (MonoCypher) in Stage 2 | 🔧 attempted, hangs | Un-stubbed code hangs in sim; previously suspected MonoCypher / OTP but earlier hangs may have been zombie-sim CPU starvation — needs re-test |
-| **+** | **Recovery handler (industry-style failure handoff)** | **✅ done** | Separate `recovery.riscv` ELF at `0x80100000`; `enter_recovery(reason_bit)` writes the failing-stage bit to the SR, sets `mtvec=RECOVERY_ENTRY`, and `mret`s to recovery on `check_manifest_header` / `check_public_key` failure (and `check_and_load_kernel` failure when re-enabled) |
+| **+** | **Recovery handler (industry-style failure handoff)** | **✅ done (sim-exit variant)** | Separate `recovery.riscv` ELF at `0x80100000` is built and FESVR-loaded; `enter_recovery(reason_bit)` writes the failing-stage bit to the SR and then **directly drives the sim to exit via tohost** (writes `(reason_bit<<1)|1` in an infinite loop, mimicking riscv-pk's `_exit`). Sim exits with FESVR-reported exit code = reason_bit. On real silicon this same `enter_recovery` would instead `mret` to the recovery image — see "Sim exit vs production mret" note below |
 | **+** | **Status Register (SR) peripheral — 32-bit boot-status MMIO** | **✅ done** | New peripheral at `0xF0003000` (`hardware/status_register/rtl/sr.scala`). BootROM sets one bit per failed stage (`SR_MANIFEST_HEADER`=0x01, `SR_PUBLIC_KEY`=0x02, …, `SR_LOCK_PMP`=0x20); recovery reads and reports which stage failed |
-| **+** | **Tempered SoC test infrastructure (negative tests)** | **✅ done** | `tests/test_tempering_manifest_header/` builds an entire parallel SoC (`TemperedSecureBootConfig`) that points the SPI flash at a deliberately-tampered hex image. Verified: Stage 0 catches the bad magic, kernel banner absent (PASS weak) |
+| **+** | **Tempered SoC test infrastructure (negative tests)** | **✅ done — PASS strong** | `tests/test_tempering_manifest_header/` builds an entire parallel SoC (`TemperedSecureBootConfig`) pointing the SPI flash at a tampered hex image. Strong PASS: kernel banner absent **AND** FESVR-reported exit code = 1 = `SR_MANIFEST_HEADER` bit. Sim runs ~10s wall-clock and exits cleanly via `$stop` |
 
 **Currently shipped (this commit):**
 - All BootROM stages 0, 1, 2, 4, 5 run end-to-end on the happy path (signature + rollback are stubs but the function bodies execute and return).
 - Stage 3 (`check_and_load_kernel`) is still commented out — bisection confirmed the SPI multi-transaction hang.
 - **PMP lock is now active**: BootROM region locked R+X (M-mode can still execute remaining instructions), OTP / Counter regions NO_ACCESS (kernel cannot read them post-lock), catch-all RWX. Kernel boots in M-mode but is isolated from the OTP root-of-trust and the rollback counter.
-- Verification failures in Stages 0, 1, 3, 5 trigger `enter_recovery(reason_bit)` which writes the failing-stage bit into the SR and `mret`s to the recovery firmware at `0x80100000`.
+- Verification failures in Stages 0, 1, 3, 5 trigger `enter_recovery(reason_bit)`, which (a) writes the failing-stage bit into the SR and (b) drives the sim to exit with that bit as the exit code via tohost. (On real silicon the same `enter_recovery` would `mret` to the recovery image at `0x80100000`; for the sim we use the tohost-exit shortcut for a strong, machine-checkable verdict — see "Sim exit vs production mret" below.)
 - **Happy path verified end-to-end**: with all integrated stages (real OTP compare + real PMP lock active), the kernel still boots and prints `kernel started successfully rocket` cleanly.
+- **Negative test verified end-to-end (PASS strong)**: tampered manifest magic → BootROM Stage 0 catches it → sim exits with exit code = `SR_MANIFEST_HEADER` bit = 1, kernel banner absent.
 
 ---
 
@@ -333,15 +334,11 @@ Un-stubbing `crypto_eddsa_check()` (MonoCypher Ed25519). Earlier attempts showed
 - An infinite loop in some MonoCypher inner routine
 - **Previous hangs may have been zombie-sim CPU starvation** (we had 17 leaked sims fighting for CPU). After OTP turned out to work fine once zombies were cleaned, Ed25519 deserves a re-test under clean CPU conditions — could plausibly Just Work.
 
-### 3. Recovery firmware printf invisible (HTIF tohost mismatch)
+### 3. ~~Recovery firmware printf invisible (HTIF tohost mismatch)~~ — RESOLVED via sim-exit shortcut
 
-When BootROM `mret`s to the recovery image (e.g., on a tampered manifest), recovery's `_start` runs and calls `printf` for diagnostics. But FESVR scans only the **first** ELF on its command line (`kernel.riscv`) for the `tohost`/`fromhost` symbols. `recovery.riscv` has its own `.htif` section at its own address, which FESVR isn't watching. Result: recovery runs, but its console output goes nowhere, and the sim never sees the exit syscall → sim hangs forever.
+(Originally: BootROM `mret`-ing to `recovery.riscv` produced no visible output because FESVR only watches the *first* ELF's `tohost`/`fromhost` symbols, not recovery's own `.htif` section.)
 
-Detected during both the `lock_pmp` self-fault investigation and the tempered negative test. Workaround in tests: rely on **kernel banner absence** (PASS weak) instead of recovery's positive output.
-
-**Fix candidates (untested, INCREMENT-future):**
-- Link recovery with `-Wl,--defsym=tohost=<kernel_tohost_addr>,--defsym=fromhost=<kernel_fromhost_addr>` so both ELFs write to the same HTIF mailbox FESVR is watching.
-- Or have `enter_recovery()` write a magic exit code directly to the (kernel) tohost address before `mret`, so the sim terminates with a known exit code even if recovery's own console is unreachable.
+**Resolution:** Took the second fix candidate listed below — instead of `mret`-ing and then trying to make recovery's HTIF mailbox visible, `enter_recovery()` now writes a known exit-code-encoded value directly to the (kernel) `tohost` address in an infinite loop, exactly mimicking riscv-pk's `_exit`. FESVR sees the write, calls `$stop` with `exit_code = reason_bit`, and the test runner reads that as the verdict. Recovery.riscv still loads at `0x80100000` (FESVR-loaded via `+payload=`) as an architectural artifact — on real silicon the same `enter_recovery` would `mret` there and recovery would `printf` its own diagnostic — but in the sim path we don't need to actually execute it.
 
 ---
 
@@ -377,6 +374,30 @@ We learned this the hard way after thinking "marker=0 means BootROM never ran." 
 - Output via a path the kernel later reads (then the kernel's read flushes through cache), or
 - Output to uncached MMIO (e.g., the SPI peripheral itself, or a debug register), or
 - Forced cache eviction (write to many distinct cache lines after the marker)
+
+### D. Sim startup is slow — short timeouts produce false negatives
+
+The Chipyard Verilator binary needs ~60-90s of wall-clock time before the kernel banner appears on the happy path (BootROM verification + crypto + DRAM warm-up). For most of a frustrating day we used 30s timeouts on negative tests, saw "no output ever appears", and chased nonexistent cache-coherency bugs. The fix was just "use 120s".
+
+**Lesson:** for any Chipyard Verilator sim, set timeouts ≥ 120s (or grep for a positive output marker and only kill on its absence). The 30s default is sized for FireSim / FPGA, not software-simulated Rocket.
+
+### E. FESVR *does* see BootROM tohost writes — the bug was HTIF protocol state, not cache
+
+We initially suspected an L1 D-cache coherency bug — "BootROM's tohost write sits dirty in L1 forever, FESVR's TSI poll sees stale DRAM=0." That hypothesis was **wrong**. A diagnostic probe at the top of `bootrom_main` writing one HTIF putc byte (`tohost = (1<<56)|(1<<48)|'H'`) showed `H` appear on FESVR's stdout immediately. So FESVR's view of tohost is *not* cache-stuck.
+
+What was actually happening: HTIF protocol is a request/response handshake. After `putc 'H'` FESVR writes an ACK to `fromhost` and expects the CPU to clear `tohost` before issuing the next operation. The probe didn't clear it; the subsequent `tohost = (exit_code<<1)|1` write was silently *ignored* because the protocol was stuck mid-handshake.
+
+**The fix is structural, not protocol-tuning:** make `enter_recovery()` the *only* tohost-writer in the BootROM (no preceding putc, no preceding diag print via HTIF). Then FESVR sees a clean first-ever tohost write with the exit-syscall bit set and fires `$stop` immediately.
+
+**Lesson:** when an HTIF write goes unnoticed, suspect protocol state poisoning before cache coherency. The two failure modes look identical from outside.
+
+### F. Bootrom contents are baked, but flash hex files are read at sim start
+
+`bootrom.img` goes through Chisel elaboration (see B) and is baked into the simulator binary, so changes need a full re-elaborate + Verilator rebuild (~5-8 min).
+
+But `flash_image/flash_image.hex` and `tempered_flash_image/flash_image.hex` are read by Verilator at **each simulation start** via `$readmemh` in `FlashStorage.sv` (relative to the Verilator working directory `$CHIPYARD_HOME/sims/verilator/`). So swapping the hex file is a zero-cost change — no rebuild needed.
+
+This asymmetry is easy to overlook. The negative test's `build.sh` step `[5/6]` *stages* the tampered hex into the Verilator working dir; bypassing `build.sh` and running `make CONFIG=TemperedSecureBootConfig` manually will compile-link but the sim will read whatever hex is already (or isn't) staged. We hit this bug once: the tempered sim binary ran but `$readmemh` found no file → flash returned all-zeros → BootROM read a zero manifest → still failed but for the wrong reason.
 
 ---
 
@@ -419,27 +440,39 @@ kernel started successfully rocket
 ```
 End-to-end clean: BootROM runs Stages 0 (magic), 1 (real OTP compare), 2 (stub), 4 (stub), 5 (clear_scratch + **real PMP lock**), then `mret`s to kernel. Kernel runs in M-mode with PMP isolating it from OTP and the rollback counter, prints success, exits via HTIF.
 
-**Negative test — tampered manifest header (`tests/test_tempering_manifest_header/`):**
+**Negative test — tampered manifest header (`tests/test_tempering_manifest_header/`) — PASS strong:**
 ```
 [UART] UART0 is here (stdin/stdout).
+*** FAILED *** (tohost = 1)
+[938305000] %Error: TestHarness.sv:99: Assertion failed: *** FAILED *** (exit code = 1)
+    at SimTSI.scala:21 assert(!error, "*** FAILED *** (exit code = %%d)\n", exit >> 1.U)
+%Error: TestHarness.sv:99: Verilog $stop
 ─────────────────────────────────────────
-PASS (weak): kernel banner absent — BootROM did not reach the success
-path. Recovery printf not visible (HTIF tohost-mismatch between
-kernel.riscv and recovery.riscv ELFs).
+PASS:
+  ✓ kernel banner absent
+  ✓ FESVR-reported exit code = 1 (= SR_MANIFEST_HEADER bit)
 ```
-A separate `TemperedSecureBootConfig` SoC was built with the SPI flash parameterized to read a manifest whose magic byte was flipped from `'SOBT'` to `'DEAD'`. The BootROM correctly refused to boot the tampered image (Stage 0 caught it and called `enter_recovery(SR_MANIFEST_HEADER)`). Strong verification of recovery output is blocked by the HTIF tohost mismatch (see "What Doesn't Work" #3).
+A separate `TemperedSecureBootConfig` SoC was built with the SPI flash parameterized to read a manifest whose magic was flipped from `0x54424F53` ('SOBT') to `0x44414544` ('DEAD'). BootROM Stage 0 catches it and calls `enter_recovery(SR_MANIFEST_HEADER)`, which writes `tohost = (1<<1)|1 = 3` in an infinite loop. FESVR shifts the exit-syscall bit off, gets exit code 1 = `SR_MANIFEST_HEADER` bit, and `$stop`s the sim cleanly. Wall-clock ~10s (BootROM fails fast, no full kernel boot).
+
+### Sim exit vs production mret
+
+Both shipped tests (happy path + negative) use the **same `enter_recovery` function** in BootROM. The difference is in how it exits:
+
+- **Happy path:** `enter_recovery` is never called — BootROM completes all stages, `mret`s to kernel @ `0x80000000`, kernel prints banner and `_exit`s via tohost.
+- **Sim negative path (current):** `enter_recovery` writes SR + drives FESVR `$stop` with `exit_code = reason_bit`. This is a **sim-only shortcut** that produces a clean machine-checkable verdict.
+- **Production negative path (designed but not exercised in sim):** the same `enter_recovery` would `mret` to `recovery.riscv` @ `0x80100000`, where the recovery image would handle re-flash / diagnostics / phone-home. FESVR is the only reason we don't do this in sim — its single-ELF HTIF mailbox model makes recovery's own `printf` invisible (see Discovery E).
+
+The decision was: a strong machine-checkable PASS signal (`exit code = SR_MANIFEST_HEADER bit`) is more valuable than a fragile visible-but-not-exit-able `printf` from recovery. Real silicon would do both.
 
 ---
 
 ## TODO (in priority order)
 
-1. **Fix HTIF tohost mismatch** — link recovery.riscv with `--defsym=tohost=<kernel_tohost>` so recovery's printf is actually visible to FESVR. Will upgrade negative tests from PASS (weak) → PASS (strong, with positive evidence of recovery output + SR contents).
+1. **More negative tests** — `test_tempering_public_key` already exists scaffolded; verify it also goes PASS strong with exit code = 2 = `SR_PUBLIC_KEY`. Then add a `tempering_signature` variant for stage 2 (when stage 2 is un-stubbed).
 2. **Re-test INCREMENT 7 (Ed25519)** — earlier hang may have been zombie-sim contention; clean sim re-test could surprise us by working.
 3. **Fix `check_and_load_kernel`** — likely rewrite as single-shot SPI read + one-shot SHA-256 hash. Critical for any real secure boot.
-4. **Redesign `lock_pmp`** — `RX+L=1` for BootROM region (or trampoline through DRAM).
-5. **More negative tests** — corrupt manifest magic, wrong signature, version rollback. Each should drive a different recovery code path (once `enter_recovery()` takes a reason argument, currently it's a single entry).
-6. **Performance measurement** — boot time breakdown per stage, BootROM image size, gate count.
-7. **Final report** — design rationale, threat model, measurements, lessons learned.
+4. **Performance measurement** — boot time breakdown per stage, BootROM image size, gate count.
+5. **Final report** — design rationale, threat model, measurements, lessons learned.
 
 ---
 

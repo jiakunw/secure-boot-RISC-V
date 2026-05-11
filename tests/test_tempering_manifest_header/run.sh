@@ -32,7 +32,12 @@ trap "rm -f $LOG" EXIT
 
 echo "Running tempered sim..."
 cd "$CHIPYARD_HOME/sims/verilator"
-stdbuf -oL "$SIM" "$KERNEL" "$RECOVERY" > "$LOG" 2>&1 || true
+# FESVR loads ONLY the first positional ELF (targs[0]). Extra ELFs must
+# be passed via the `+payload=<path>` plusarg, which goes through FESVR's
+# `payloads` list and gets loaded in addition to the primary kernel.
+stdbuf -oL "$SIM" "+payload=$RECOVERY" "$KERNEL" > "$LOG" 2>&1
+SIM_EXIT=$?
+echo "sim exit code: $SIM_EXIT  (kernel-success path → 0; BootROM-tohost-exit path → reason_bit)"
 
 echo
 echo "── sim output ───────────────────────────────────────────────────"
@@ -40,16 +45,37 @@ cat "$LOG"
 echo "─────────────────────────────────────────────────────────────────"
 
 PASS=true
+EVIDENCE=""
+
+# Signal 1: kernel banner — must be ABSENT (BootROM rejected the image)
 if grep -q "kernel started successfully" "$LOG"; then
     echo "FAIL: kernel banner present — Stage 0 (check_manifest_header) did NOT catch the tampered magic"
     PASS=false
-fi
-if grep -q "check_manifest_header failed" "$LOG"; then
-    echo "PASS: recovery printed expected message (Stage 0 caught the tamper, SR bit 0 set)"
-elif grep -q "boot status register = 0x00000001" "$LOG"; then
-    echo "PASS: SR shows 0x00000001 (bit 0 = check_manifest_header)"
-elif ! grep -q "kernel started successfully" "$LOG"; then
-    echo "PASS (weak): kernel banner absent — BootROM did not reach success path. Recovery printf not visible (likely HTIF tohost-mismatch between kernel.riscv and recovery.riscv ELFs)."
+else
+    EVIDENCE="$EVIDENCE\n  ✓ kernel banner absent"
 fi
 
-$PASS && exit 0 || exit 1
+# Signal 2: FESVR-reported exit code = reason_bit (BootROM's tohost-exit signal).
+# SR_MANIFEST_HEADER = 1, so "exit code = 1" means Stage 0 caught the tamper.
+# Note: Verilator's $stop returns host exit 255; the SoC-level exit code is in
+# the SimTSI assertion line: "Assertion failed: *** FAILED *** (exit code = 1)".
+if grep -qE "exit code =[[:space:]]+1\b" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ FESVR-reported exit code = 1 (= SR_MANIFEST_HEADER bit)"
+fi
+
+# Signal 3: recovery's own printout (best evidence, may not be visible)
+if grep -q "check_manifest_header failed" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ recovery printed expected diagnostic"
+fi
+
+# Signal 4: SR readout in log
+if grep -q "boot status register = 0x00000001" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ recovery confirmed SR = 0x00000001"
+fi
+
+if $PASS; then
+    echo -e "PASS:$EVIDENCE"
+    exit 0
+else
+    exit 1
+fi
