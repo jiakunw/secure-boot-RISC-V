@@ -44,6 +44,9 @@ class SecureBootConfig extends Config(
     hashPath = SecureBootPaths.pubkeyHash
   ) ++
   new chipyard.WithSecureBootRollback() ++
+  new chipyard.WithSecureBootEd25519(
+    address = 0xF0004000L
+  ) ++
   new chipyard.WithSecureBootSR() ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.AbstractConfig

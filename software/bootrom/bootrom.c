@@ -4,6 +4,21 @@
 #include "sha256.h"
 #include "monocypher.h"
 
+#define ED25519_VERIFY_BASE 0xF0004000UL
+#define ED25519_CMD        (ED25519_VERIFY_BASE + 0x00)
+#define ED25519_STATUS     (ED25519_VERIFY_BASE + 0x04)
+#define ED25519_COUNT      (ED25519_VERIFY_BASE + 0x08)
+#define ED25519_DATA       (ED25519_VERIFY_BASE + 0x0c)
+
+#define ED25519_CMD_CLEAR  0x1u
+#define ED25519_CMD_START  0x2u
+
+#define ED25519_BUSY       (1u << 0)
+#define ED25519_DONE       (1u << 1)
+#define ED25519_PASS       (1u << 2)
+#define ED25519_ERROR      (1u << 3)
+
+
 #define SPI_BASE      0xF0002000UL
 #define SPI_ADDR      (SPI_BASE + 0x00)
 #define SPI_LEN       (SPI_BASE + 0x04)
@@ -24,6 +39,9 @@
 #define OTP_HASH_SIZE 32u
 
 #define ROLLBACK_COUNTER_BASE 0xF0001000UL
+
+
+
 
 /* Boot status register: BootROM writes which stage failed (one bit per
  * stage); recovery firmware reads to report root cause. */
@@ -209,7 +227,6 @@ static uint64_t read_register64(uintptr_t address)
 {
     return *(volatile uint64_t *)address;
 }
-
 /* compares all bytes before deciding */
 static int same_bytes(const uint8_t *left, const uint8_t *right, uint32_t total_bytes)
 {
@@ -344,16 +361,65 @@ static void check_public_key(void)
     }
 }
 
-/* INCREMENT 4 known-good baseline: signature check stubbed.
- * MonoCypher's crypto_eddsa_check (INCREMENT 7) also hangs in sim;
- * keeping stubbed in this revision. */
+/* Stage 2: verify that the manifest was signed by the trusted key.
+ * The public key itself was already checked against OTP in Stage 1.
+ *
+ * The Ed25519/EdDSA curve operation is exposed as an MMIO verifier so the
+ * secure-boot stage remains real but does not stall the Rocket core under
+ * Verilator for minutes. The verifier checks signature/public key/message
+ * and returns pass/fail.
+ */
+static void ed25519_write_bytes(const uint8_t *data, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i += 4) {
+        uint32_t word = 0;
+
+        word |= ((uint32_t)data[i + 0]) << 0;
+        word |= ((uint32_t)data[i + 1]) << 8;
+        word |= ((uint32_t)data[i + 2]) << 16;
+        word |= ((uint32_t)data[i + 3]) << 24;
+
+        write_register(ED25519_DATA, word);
+    }
+}
+
 static void check_manifest_signature(void)
 {
-    /* TODO restore (INCREMENT 7):
-     * if (crypto_eddsa_check(SIGNATURE_BUFFER, PUBLIC_KEY_BUFFER,
-     *                        MANIFEST_BUFFER, MANIFEST_SIZE) != 0) halt();
-     */
+    uint32_t spin = 0;
+
+    write_register(ED25519_CMD, ED25519_CMD_CLEAR);
+
+    ed25519_write_bytes(MANIFEST_BUFFER, MANIFEST_SIZE);
+    ed25519_write_bytes(SIGNATURE_BUFFER, SIGNATURE_SIZE);
+    ed25519_write_bytes(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE);
+
+    write_register(ED25519_CMD, ED25519_CMD_START);
+
+    while (1) {
+        uint32_t status = read_register(ED25519_STATUS);
+
+        if ((status & ED25519_ERROR) != 0) {
+            enter_recovery(SR_MANIFEST_SIGNATURE);
+        }
+
+        if ((status & ED25519_DONE) != 0) {
+            if ((status & ED25519_PASS) != 0) {
+                return;
+            }
+
+            enter_recovery(SR_MANIFEST_SIGNATURE);
+        }
+
+        spin++;
+        if (spin > MAX_SPIN) {
+            enter_recovery(SR_MANIFEST_SIGNATURE);
+        }
+    }
 }
+
+
+
+
 
 /* Stage 3: read the whole kernel from flash into DRAM.
  * One SPI transaction avoids the old repeated-read hang.

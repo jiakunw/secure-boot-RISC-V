@@ -1688,7 +1688,15 @@ void crypto_eddsa_mul_add(u8 r[32],
 // ge_precomp: Z  = 1
 typedef struct { fe X;  fe Y;  fe Z; fe T;  } ge;
 typedef struct { fe Yp; fe Ym; fe Z; fe T2; } ge_cached;
+
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+#include "secureboot_ed25519_lut.h"
+#ifndef SECUREBOOT_ED25519_LUT_H
+#error "secureboot_ed25519_lut.h was not included correctly"
+#endif
+#endif
 typedef struct { fe Yp; fe Ym;       fe T2; } ge_precomp;
+
 
 static void ge_zero(ge *p)
 {
@@ -1961,76 +1969,179 @@ static int slide_step(slide_ctx *ctx, int width, int i, const u8 scalar[32])
 	return i == ctx->next_index ? ctx->next_digit: 0;
 }
 
-#define P_W_WIDTH 3 // Affects the size of the stack
-#define B_W_WIDTH 5 // Affects the size of the binary
+#ifndef SECUREBOOT_P_W_WIDTH
+#define SECUREBOOT_P_W_WIDTH 3
+#endif
+
+#define P_W_WIDTH SECUREBOOT_P_W_WIDTH
+#define B_W_WIDTH 5
 #define P_W_SIZE  (1<<(P_W_WIDTH-2))
+#define B_W_SIZE  (1<<(B_W_WIDTH-2))
+
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+#if P_W_SIZE != SECUREBOOT_PUBLIC_KEY_LUT_SIZE
+#error "SECUREBOOT_PUBLIC_KEY_LUT_SIZE does not match P_W_SIZE"
+#endif
+#endif
+
+
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+#endif
+
+
+
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+/*
+ * SecureBoot Ed25519 profile.
+ *
+ * This is the single compile-time contract for the boot verifier:
+ *   P side = trusted public key table
+ *   B side = fixed basepoint table
+ *
+ * The generated LUT header must agree with these sizes, or the build stops.
+ */
+#ifndef SECUREBOOT_P_W_WIDTH
+#error "SECUREBOOT_P_W_WIDTH must be defined for secureboot Ed25519 build"
+#endif
+
+#ifndef SECUREBOOT_B_W_WIDTH
+#error "SECUREBOOT_B_W_WIDTH must be defined for secureboot Ed25519 build"
+#endif
+
+#undef P_W_WIDTH
+#undef B_W_WIDTH
+#undef P_W_SIZE
+#undef B_W_SIZE
+
+#define P_W_WIDTH SECUREBOOT_P_W_WIDTH
+#define B_W_WIDTH SECUREBOOT_B_W_WIDTH
+#define P_W_SIZE  (1 << (P_W_WIDTH - 2))
+#define B_W_SIZE  (1 << (B_W_WIDTH - 2))
+
+#if P_W_SIZE != SECUREBOOT_PUBLIC_KEY_LUT_SIZE
+#error "SECUREBOOT_PUBLIC_KEY_LUT_SIZE does not match P_W_SIZE"
+#endif
+
+#if B_W_SIZE != SECUREBOOT_BASEPOINT_LUT_SIZE
+#error "SECUREBOOT_BASEPOINT_LUT_SIZE does not match B_W_SIZE"
+#endif
+#endif
 
 int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
                                 const u8 h[32])
 {
-	ge minus_A; // -public_key
-	ge minus_R; // -first_half_of_signature
+	ge minus_A;
+	ge minus_R;
 	const u8 *s = signature + 32;
 
-	// Check that A and R are on the curve
-	// Check that 0 <= S < L (prevents malleability)
-	// *Allow* non-cannonical encoding for A and R
 	{
 		u32 s32[8];
 		load32_le_buf(s32, s, 8);
-		if (ge_frombytes_neg_vartime(&minus_A, public_key) ||
-		    ge_frombytes_neg_vartime(&minus_R, signature)  ||
+
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+		if (crypto_verify32(public_key, secureboot_ed25519_public_key) ||
+		    ge_frombytes_neg_vartime(&minus_R, signature) ||
 		    is_above_l(s32)) {
 			return -1;
 		}
+#else
+		if (ge_frombytes_neg_vartime(&minus_A, public_key) ||
+		    ge_frombytes_neg_vartime(&minus_R, signature) ||
+		    is_above_l(s32)) {
+			return -1;
+		}
+#endif
 	}
 
-	// look-up table for minus_A
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+	#if P_W_SIZE != SECUREBOOT_PUBLIC_KEY_LUT_SIZE
+	#error "SECUREBOOT_PUBLIC_KEY_LUT_SIZE does not match P_W_SIZE"
+	#endif
+
+	#if B_W_SIZE != SECUREBOOT_BASEPOINT_LUT_SIZE
+	#error "SECUREBOOT_BASEPOINT_LUT_SIZE does not match B_W_SIZE"
+	#endif
+
+	const ge_cached *lutA = secureboot_public_key_lut;
+	const ge_cached *lutMinusB = secureboot_minus_basepoint_lut;
+#else
 	ge_cached lutA[P_W_SIZE];
+
 	{
-		ge minus_A2, tmp;
+		ge minus_A2;
+		ge tmp;
+
 		ge_double(&minus_A2, &minus_A, &tmp);
 		ge_cache(&lutA[0], &minus_A);
+
 		FOR (i, 1, P_W_SIZE) {
-			ge_add(&tmp, &minus_A2, &lutA[i-1]);
+			ge_add(&tmp, &minus_A2, &lutA[i - 1]);
 			ge_cache(&lutA[i], &tmp);
 		}
 	}
+#endif
 
-	// sum = [s]B - [h]A
-	// Merged double and add ladder, fused with sliding
-	slide_ctx h_slide;  slide_init(&h_slide, h);
-	slide_ctx s_slide;  slide_init(&s_slide, s);
+	slide_ctx h_slide;
+	slide_ctx s_slide;
+
+	slide_init(&h_slide, h);
+	slide_init(&s_slide, s);
+
 	int i = MAX(h_slide.next_check, s_slide.next_check);
-	ge *sum = &minus_A; // reuse minus_A for the sum
+
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+	ge secureboot_sum_storage;
+	ge *sum = &secureboot_sum_storage;
+#else
+	ge *sum = &minus_A;
+#endif
+
 	ge_zero(sum);
+
 	while (i >= 0) {
 		ge tmp;
 		ge_double(sum, sum, &tmp);
+
 		int h_digit = slide_step(&h_slide, P_W_WIDTH, i, h);
 		int s_digit = slide_step(&s_slide, B_W_WIDTH, i, s);
+
 		if (h_digit > 0) { ge_add(sum, sum, &lutA[ h_digit / 2]); }
 		if (h_digit < 0) { ge_sub(sum, sum, &lutA[-h_digit / 2]); }
-		fe t1, t2;
-		if (s_digit > 0) { ge_madd(sum, sum, b_window +  s_digit/2, t1, t2); }
-		if (s_digit < 0) { ge_msub(sum, sum, b_window + -s_digit/2, t1, t2); }
+
+#ifdef SECUREBOOT_PRECOMPUTED_PUBLIC_KEY_LUT
+		/*
+		 * lutMinusB stores negative odd multiples of the base point.
+		 * To add +[k]B, subtract the cached negative point.
+		 * To add -[k]B, add the cached negative point.
+		 */
+		if (s_digit > 0) { ge_sub(sum, sum, &lutMinusB[ s_digit / 2]); }
+		if (s_digit < 0) { ge_add(sum, sum, &lutMinusB[-s_digit / 2]); }
+#else
+		fe t1;
+		fe t2;
+
+		if (s_digit > 0) { ge_madd(sum, sum, b_window +  s_digit / 2, t1, t2); }
+		if (s_digit < 0) { ge_msub(sum, sum, b_window + -s_digit / 2, t1, t2); }
+#endif
+
 		i--;
 	}
 
-	// Compare [8](sum-R) and the zero point
-	// The multiplication by 8 eliminates any low-order component
-	// and ensures consistency with batched verification.
 	ge_cached cached;
 	u8 check[32];
-	static const u8 zero_point[32] = {1}; // Point of order 1
+	static const u8 zero_point[32] = {1};
+
 	ge_cache(&cached, &minus_R);
 	ge_add(sum, sum, &cached);
-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
+	ge_double(sum, sum, &minus_R);
+	ge_double(sum, sum, &minus_R);
+	ge_double(sum, sum, &minus_R);
 	ge_tobytes(check, sum);
+
 	return crypto_verify32(check, zero_point);
 }
+
+
 
 // 5-bit signed comb in cached format (Niels coordinates, Z=1)
 static const ge_precomp b_comb_low[8] = {

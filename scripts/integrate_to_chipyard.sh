@@ -1,4 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  echo "ERROR: do not source this script."
+  echo "Run it with:"
+  echo "  bash scripts/integrate_to_chipyard.sh"
+  return 1
+fi
+
 set -e
 
 # ─────────────────────────────────────────────
@@ -83,6 +91,76 @@ if [ -n "$SV_SOURCES" ]; then
 fi
 
 echo ""
+echo ""
+echo "[1b/5] Linking Ed25519 verifier peripheral..."
+mkdir -p "$CHIPYARD/generators/chipyard/src/main/scala/secureboot"
+mkdir -p "$CHIPYARD/generators/chipyard/src/main/resources/vsrc"
+
+ED_SRC="$MYREPO/hardware/ed25519/rtl/ed25519_verifier.scala"
+ED_DST="$CHIPYARD/generators/chipyard/src/main/scala/secureboot/ed25519_verifier.scala"
+
+if [ "$(readlink -f "$ED_SRC")" = "$(readlink -f "$ED_DST" 2>/dev/null || echo "$ED_DST")" ]; then
+    echo "  ed25519_verifier.scala already staged"
+else
+    cp -f "$ED_SRC" "$ED_DST"
+fi
+
+ED_SV_SRC="$MYREPO/hardware/ed25519/vsrc/Ed25519VerifierSim.sv"
+ED_SV_DST="$CHIPYARD/generators/chipyard/src/main/resources/vsrc/Ed25519VerifierSim.sv"
+
+if [ "$(readlink -f "$ED_SV_SRC")" = "$(readlink -f "$ED_SV_DST" 2>/dev/null || echo "$ED_SV_DST")" ]; then
+    echo "  Ed25519VerifierSim.sv already staged"
+else
+    cp -f "$ED_SV_SRC" "$ED_SV_DST"
+fi
+
+echo "  Linked ed25519_verifier.scala"
+echo "  Linked Ed25519VerifierSim.sv"
+
+# Check/patch the subsystem class that mixes in the other secureboot traits.
+echo "  Checking DigitalTop Ed25519 trait..."
+python3 - "$CHIPYARD/generators/chipyard/src/main/scala" <<'PY2'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+
+# If already patched anywhere, do not fail.
+for p in root.rglob("*.scala"):
+    s = p.read_text(errors="ignore")
+    if "with chipyard.CanHavePeripherySecureBootEd25519" in s or "with CanHavePeripherySecureBootEd25519" in s:
+        print(f"  CanHavePeripherySecureBootEd25519 already patched in {p}")
+        raise SystemExit(0)
+
+# Find the actual mixin site, not the trait-definition file.
+candidates = []
+for p in root.rglob("*.scala"):
+    s = p.read_text(errors="ignore")
+    if "trait CanHavePeripherySecureBootSR" in s:
+        continue
+    if re.search(r"with\s+(chipyard\.)?CanHavePeripherySecureBootSR\b", s):
+        candidates.append(p)
+
+if not candidates:
+    print("Error: could not find DigitalTop/subsystem mixin site with CanHavePeripherySecureBootSR")
+    raise SystemExit(1)
+
+target = candidates[0]
+s = target.read_text()
+m = re.search(r"with\s+(chipyard\.)?CanHavePeripherySecureBootSR\b", s)
+if not m:
+    print(f"Error: candidate found but SR mixin line missing: {target}")
+    raise SystemExit(1)
+
+qualifier = m.group(1) or ""
+insert = f"\n  with {qualifier}CanHavePeripherySecureBootEd25519"
+s = s[:m.end()] + insert + s[m.end():]
+target.write_text(s)
+print(f"  Patched {target} with CanHavePeripherySecureBootEd25519")
+PY2
+
+
 echo "[1c/5] Patching Chipyard DigitalTop for secure boot peripherals (OTP + Rollback + SPI + Status Register)..."
 DIGITAL_TOP=$CHIPYARD/generators/chipyard/src/main/scala/DigitalTop.scala
 if [ -f "$DIGITAL_TOP" ]; then
@@ -121,6 +199,30 @@ fi
 # 2. Build BootROM
 # ─────────────────────────────────────────────
 echo ""
+echo ""
+echo "[1b/5] Generating Ed25519 public-key lookup table..."
+if [ ! -f "$MYREPO/tools/generate_ed25519_lut.py" ]; then
+    echo "Error: missing $MYREPO/tools/generate_ed25519_lut.py"
+    exit 1
+fi
+
+if [ ! -f "$MYREPO/metadata/public_key.bin" ]; then
+    echo "Error: missing $MYREPO/metadata/public_key.bin"
+    exit 1
+fi
+
+python3 "$MYREPO/tools/generate_ed25519_lut.py"
+
+if [ ! -f "$MYREPO/software/crypto/include/secureboot_ed25519_lut.h" ]; then
+    echo "Error: LUT header was not generated"
+    exit 1
+fi
+
+grep -q "SECUREBOOT_PUBLIC_KEY_LUT_SIZE 64" "$MYREPO/software/crypto/include/secureboot_ed25519_lut.h" || {
+    echo "Error: LUT header does not contain 64-entry table size"
+    exit 1
+}
+
 echo "[2/5] Building BootROM..."
 if [ -f "$MYREPO/software/bootrom/Makefile" ]; then
     cd "$MYREPO/software/bootrom"
@@ -131,8 +233,13 @@ if [ -f "$MYREPO/software/bootrom/Makefile" ]; then
         mkdir -p "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.SecureBootConfig"
         cp bootrom.img \
            "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.SecureBootConfig/bootrom.secureboot.rv64.img"
+        BOOTROM_IMG_SIZE=$(stat -c%s bootrom.img)
         echo "  Built and copied to Chipyard."
-        echo "  Size: $(stat -c%s bootrom.img) bytes"
+        echo "  Size: ${BOOTROM_IMG_SIZE} bytes"
+        if [ "$BOOTROM_IMG_SIZE" -gt 65536 ]; then
+            echo "  Error: bootrom.img exceeds 64 KiB BootROM size"
+            exit 1
+        fi
     else
         echo "  Error: bootrom.img not produced"
         exit 1
@@ -146,17 +253,23 @@ fi
 # ─────────────────────────────────────────────
 echo ""
 echo "[3/5] Copying kernel + recovery sources to Chipyard tests..."
-if ls $MYREPO/software/kernel/*.c 1> /dev/null 2>&1; then
-    cp $MYREPO/software/kernel/*.c   $TESTS_DIR/ 2>/dev/null || true
-    cp $MYREPO/software/kernel/*.h   $TESTS_DIR/ 2>/dev/null || true
+
+shopt -s nullglob
+KERNEL_C_SOURCES=("$MYREPO"/software/kernel/*.c)
+KERNEL_H_SOURCES=("$MYREPO"/software/kernel/*.h)
+shopt -u nullglob
+
+if [ ${#KERNEL_C_SOURCES[@]} -gt 0 ]; then
+    cp "${KERNEL_C_SOURCES[@]}" "$TESTS_DIR/"
+    if [ ${#KERNEL_H_SOURCES[@]} -gt 0 ]; then
+        cp "${KERNEL_H_SOURCES[@]}" "$TESTS_DIR/"
+    fi
     echo "  Copied kernel source(s)."
 else
-    echo "  (No kernel sources, skipping kernel/recovery build)"
-    echo ""
-    echo "Done (BootROM + Chisel only). Run:"
-    echo "  cd $CHIPYARD/sims/verilator"
-    echo "  make CONFIG=SecureBootConfig"
-    exit 0
+    echo "  Error: no kernel .c sources found in:"
+    echo "    $MYREPO/software/kernel"
+    echo "  This must exist before manifest/signature/flash can be generated."
+    exit 1
 fi
 
 ## Recovery firmware is built standalone via its own Makefile below (not
