@@ -344,10 +344,23 @@ static void check_manifest_signature(void)
 /* Stage 3: read the kernel from flash, hash it, copy to DRAM. Currently
  * NOT called from bootrom_main (multi-transaction SPI bug under
  * investigation), but logic kept current so it's ready when fixed. */
+/* Stage 3: load kernel from SPI flash into DRAM, hash it, compare to
+ * manifest's payload_hash.
+ *
+ * Single SPI transaction reads the entire kernel directly into DRAM at
+ * manifest->load_address. The original implementation read in 16 × 512-byte
+ * chunks with incremental SHA-256 — bisection (PROGRESS.md INCREMENT 4)
+ * showed that hangs in the SPI master state machine after the first
+ * transaction. One large transaction + one SHA-256 over the loaded buffer
+ * sidesteps the multi-transaction issue and is also simpler.
+ *
+ * Loading into the SAME physical address FESVR already pre-loaded
+ * kernel.riscv into is fine: BootROM overwrites with the SAME bytes
+ * (kernel.bin = objcopy -O binary kernel.riscv, so identical content),
+ * then mret's to load_address. The fence + fence.i in jump_to_kernel
+ * makes the writes visible to instruction fetch. */
 static void check_and_load_kernel(const manifest_t *manifest)
 {
-    sha256_ctx ctx;
-    uint32_t copied = 0;
     uint8_t *kernel_output = (uint8_t *)(uintptr_t)manifest->load_address;
 
     if (manifest->payload_size == 0) {
@@ -358,20 +371,9 @@ static void check_and_load_kernel(const manifest_t *manifest)
         enter_recovery(SR_LOAD_KERNEL);
     }
 
-    sha256_init(&ctx);
+    read_flash(KERNEL_OFFSET, manifest->payload_size, kernel_output);
 
-    while (copied < manifest->payload_size) {
-        uint32_t left = manifest->payload_size - copied;
-        uint32_t chunk_size = left < KERNEL_CHUNK_SIZE ? left : KERNEL_CHUNK_SIZE;
-
-        read_flash(KERNEL_OFFSET + copied, chunk_size, KERNEL_CHUNK);
-        sha256_update(&ctx, KERNEL_CHUNK, chunk_size);
-        copy_bytes(kernel_output + copied, KERNEL_CHUNK, chunk_size);
-
-        copied += chunk_size;
-    }
-
-    sha256_final(&ctx, KERNEL_HASH_BUFFER);
+    sha256_hash(kernel_output, manifest->payload_size, KERNEL_HASH_BUFFER);
 
     if (!same_bytes(KERNEL_HASH_BUFFER, manifest->payload_hash, SHA256_DIGEST_SIZE)) {
         enter_recovery(SR_LOAD_KERNEL);
@@ -511,7 +513,7 @@ void bootrom_main(void)
     check_manifest_header(manifest);
     check_public_key();
     check_manifest_signature();
-    /* check_and_load_kernel(manifest);  -- bisection showed bug in this fn; skip for now */
+    check_and_load_kernel(manifest);
 
     check_rollback_counter(manifest);
 
