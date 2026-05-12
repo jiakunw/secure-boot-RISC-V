@@ -81,10 +81,27 @@ SECTIONS
         KEEP (*(.dtors))
     }
 
-    /* Host-Target Interface */
-    .htif ALIGN(0x40) : {
+    /* Host-Target Interface — anchored at 0x80001e00 to match the
+     * address FESVR watches (set from kernel.riscv's symbol table, since
+     * FESVR's `load_program` reads `tohost_addr` only from `targs[0]`).
+     *
+     * Why this is needed: htif_nano's `htif_syscall` (used by stdio's
+     * `_write`, hence printf) defines `tohost` as `static volatile` in
+     * its own translation unit. The reference is PC-relative within the
+     * link, so Makefile `--defsym=tohost=...` does NOT redirect it. The
+     * only way to redirect htif_syscall's writes to FESVR's watched
+     * address is to force the .htif section's VMA there.
+     *
+     * NOLOAD: recovery doesn't actually place bytes here — kernel.riscv
+     * (targs[0]) already loaded initial zero bytes at 0x80001e00 as its
+     * own tohost/fromhost slots. Recovery just *references* this region
+     * at runtime (via its own htif_syscall) and FESVR is already
+     * watching it. */
+    save_dot = .;
+    .htif 0x80001e00 (NOLOAD) : AT(save_dot) {
         *(.htif)
     }
+    . = save_dot;
 
     .data : ALIGN (8) {
         *(.data)

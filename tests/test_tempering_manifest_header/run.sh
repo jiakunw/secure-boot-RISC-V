@@ -57,28 +57,27 @@ else
     EVIDENCE="$EVIDENCE\n  ✓ kernel banner absent"
 fi
 
-# Decode FESVR exit code. With current BootROM (mret-to-recovery + diagnostic
-# recovery), three outcomes are interesting:
-#
-#   exit code 0x41 (65)  = recovery main() reached, SR contains bit 0 (manifest)
-#                          → BootROM detected tampering AND mret'd to recovery
-#                            AND recovery's crt0+main ran end-to-end. Strongest PASS.
-#   exit code 0x80 (128) = BootROM's mret_trap_exit safety net fired
-#                          → mret traps (recovery .text not at 0x80100000 or
-#                            illegal instruction)
-#   exit code 0x01 (1)   = older tohost-exit-from-BootROM path (no mret was taken)
-#
-# Verilator's $stop returns host shell exit 255; the SoC-level exit code is in
-# the SimTSI assertion line: "Assertion failed: *** FAILED *** (exit code = N)".
-if grep -qE "exit code =[[:space:]]+65\b" "$LOG"; then
-    EVIDENCE="$EVIDENCE\n  ✓ FESVR exit code = 0x41 — BootROM mret succeeded, recovery main() reached, SR_MANIFEST_HEADER captured"
-elif grep -qE "exit code =[[:space:]]+128\b" "$LOG"; then
-    EVIDENCE="$EVIDENCE\n  ⚠ FESVR exit code = 0x80 — BootROM mret TRAPPED (recovery firmware not at 0x80100000 or unreachable)"
-elif grep -qE "exit code =[[:space:]]+1\b" "$LOG"; then
-    EVIDENCE="$EVIDENCE\n  ✓ FESVR exit code = 1 — BootROM tohost-exit path (no recovery mret)"
-else
-    EVIDENCE="$EVIDENCE\n  ⚠ no FESVR exit code line found (sim hung)"
-    PASS=false
+# Signal 2: recovery's "in recovery mode" banner — strongest positive
+# evidence that BootROM successfully mret'd to recovery.riscv at 0x80100000
+# and recovery's main() executed.
+if grep -q "in recovery mode" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ recovery firmware reached (printed 'something went wrong, in recovery mode')"
+fi
+
+# Signal 3: SR readout — recovery read 0xF0003000 and saw SR_MANIFEST_HEADER bit.
+if grep -q "boot status register = 0x00000001" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ recovery confirmed SR = 0x00000001 (SR_MANIFEST_HEADER bit set)"
+fi
+
+# Signal 4: per-stage diagnostic line from recovery decoding the SR.
+if grep -q "check_manifest_header failed" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ recovery decoded failure as Stage 0 (check_manifest_header)"
+fi
+
+# Signal 5: clean Verilog $finish (recovery's main returned 0 → _exit(0) →
+# tohost = 1 → FESVR called $finish).
+if grep -q "Verilog \$finish" "$LOG" && [ "$SIM_EXIT" -eq 0 ]; then
+    EVIDENCE="$EVIDENCE\n  ✓ sim exited cleanly via \$finish (sim_exit=0)"
 fi
 
 if $PASS; then

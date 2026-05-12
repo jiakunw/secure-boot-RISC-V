@@ -30,21 +30,22 @@ LDFLAGS = -static -T recovery.ld \
 
 SRC    = recovery.c
 ELF    = recovery.riscv
-BIN    = recovery.bin
 DUMP   = recovery.dump
 
-all: $(ELF) $(BIN) $(DUMP)
+# Note: no recovery.bin target. FESVR loads recovery.riscv (ELF) directly.
+# objcopy -O binary on the new layout (with .htif anchored at 0x80001e00)
+# fills the ~1MB address gap between .htif and .text with zeros → useless
+# 1MB output. The ELF format handles the sparse layout fine.
+
+all: $(ELF) $(DUMP)
 
 $(ELF): $(SRC) recovery.ld
 	$(GCC) $(SPECS) $(ARCH_FLAGS) $(CFLAGS) $(LDFLAGS) $(SRC) -o $(ELF)
-
-$(BIN): $(ELF)
-	$(OBJCOPY) -O binary $(ELF) $(BIN)
 
 $(DUMP): $(ELF)
 	$(OBJDUMP) -d $(ELF) > $(DUMP)
 
 clean:
-	rm -f $(ELF) $(BIN) $(DUMP)
+	rm -f $(ELF) recovery.bin $(DUMP)
 
 .PHONY: all clean

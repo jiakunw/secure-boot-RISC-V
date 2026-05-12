@@ -334,20 +334,54 @@ Un-stubbing `crypto_eddsa_check()` (MonoCypher Ed25519). Earlier attempts showed
 - An infinite loop in some MonoCypher inner routine
 - **Previous hangs may have been zombie-sim CPU starvation** (we had 17 leaked sims fighting for CPU). After OTP turned out to work fine once zombies were cleaned, Ed25519 deserves a re-test under clean CPU conditions — could plausibly Just Work.
 
-### 3. Recovery firmware `printf` specifically hangs — narrowed to htif_nano putc path
+### 3. ~~Recovery firmware `printf` hangs~~ — root-caused and fixed via linker anchor + stdio bypass
 
-**Status:** Localized but not yet fully diagnosed. The full mret-to-recovery handoff works end-to-end (proven by exit code `0x41` — see Recovery Handler section). The only thing that doesn't work is recovery's `printf` itself: with a `printf` in `recovery_main()`, sim hangs forever at the first character of output. Without `printf` (just direct `tohost` exit-syscall write from `recovery_main`), recovery main runs and the test passes cleanly.
+**Status:** FULLY DIAGNOSED 2026-05-12. Recovery now prints its full human-readable diagnostic and exits cleanly via `$finish`. Two distinct bugs were uncovered in sequence:
 
-**What we tried and what we learned (chronological, 2026-05-12):**
+#### Bug A: htif_nano's `htif_syscall` writes to the wrong `tohost` address
 
-1. **Initially** assumed FESVR didn't see recovery's `tohost` writes because recovery uses `Makefile --defsym=tohost=0x80001e00` (absolute symbol) instead of a real `.htif`-section symbol like kernel.riscv has.
-2. **Verified by reading FESVR source** (`riscv-isa-sim/fesvr/htif.cc::load_program`): FESVR sets `tohost_addr` exclusively from `targs[0]`'s symbol table; payloads loaded via `+payload=` have their data loaded into memory but their symbols are ignored. So FESVR watches `0x80001e00` (kernel's address). Recovery's `--defsym` aligns its `tohost` references to the same `0x80001e00`. ⇒ FESVR *should* see recovery's writes. **Hypothesis A: rejected.**
-3. **Rewrote `recovery_main` to bypass `printf`** entirely — just read SR via MMIO and write `tohost = ((0x40 | sr_bits) << 1) | 1` in an infinite loop, mimicking riscv-pk's `_exit`. Rebuilt and ran. Result: sim exits cleanly with exit code `0x41`. ⇒ Recovery's `_start` crt0 (FP init, TLS, BSS clear, `__libc_init_array`) **does** work at `0x80100000`. ⇒ **Hypothesis B (crt0 hangs): rejected.**
-4. **Remaining hypothesis C: `htif_nano`'s `printf` → `htif_putc` handshake has a sim-specific cache or protocol issue.** The plausible mechanism: kernel.riscv's `tohost`/`fromhost` are in a real `.htif` section with an aligned `volatile`-friendly layout; recovery's are `--defsym`'d absolute symbols which the linker/loader treats slightly differently for cache / coherency purposes during the FESVR ack handshake on `fromhost`. We have **not** isolated this; production silicon wouldn't have FESVR in the picture so it's a sim-specific quirk.
+**Symptom:** Earlier recovery built with `Makefile --defsym=tohost=0x80001e00,--defsym=fromhost=0x80001e08` still hung on every `printf`, even though those addresses match what FESVR watches (FESVR sets `tohost_addr` from `targs[0]`=kernel.riscv's symbol table; verified by reading `riscv-isa-sim/fesvr/htif.cc::load_program`).
 
-**Resolution shipped:** Recovery is built with no `printf` — just SR-read-and-exit-via-tohost. The 0x40 marker bit + SR bits in the FESVR exit code give a single integer that proves both "mret reached recovery main" and "which BootROM stage failed". No information lost relative to the `printf` version; just no human-readable narration in the log.
+**Root cause:** `htif_nano`'s `htif_syscall` (in libgloss) defines `tohost` as `static volatile` in the same translation unit. The compiler emits a PC-relative reference (`auipc + addi`) within the link-time placement, so `--defsym` (which only redirects extern references) does NOT redirect this. Recovery's `htif_syscall` ended up writing to the .htif section's natural placement inside recovery's image (~`0x80101ec0`), which FESVR isn't watching.
 
-A future investigation could un-stub `printf` and bisect where in `htif_putc` it stalls (e.g., insert a tohost-exit before/after the `tohost` write to identify whether it's the request write that gets lost, the fromhost ack poll that hangs, or the lock acquisition).
+Compare disassembly:
+```
+recovery's htif_syscall (OLD, broken):           recovery's _exit (always worked):
+  auipc a3, 0x0                                    auipc a4, 0xfff00
+  addi  a3, a3, 978   # → 0x80101ec0 ❌           addi a4, a4, 736   # → 0x80001e00 ✓
+  sd    a2, 0(a3)     # writes to recovery's       sd  a5, 0(a4)     # uses --defsym
+                      #   own .htif slot                              #   override
+```
+
+**Fix:** `recovery.ld` anchors the `.htif` output section's VMA at `0x80001e00` with `(NOLOAD)`:
+```ld
+save_dot = .;
+.htif 0x80001e00 (NOLOAD) : AT(save_dot) {
+    *(.htif)
+}
+. = save_dot;
+```
+This makes `htif_syscall`'s PC-relative tohost reference resolve to `0x80001e00` (FESVR's watched address). `(NOLOAD)` means recovery doesn't *place bytes* there at load time — that's fine because kernel.riscv (FESVR's `targs[0]`) already loaded its own `.htif` section (initial zeros) at exactly that address.
+
+#### Bug B: newlib's `_puts_r` faults on `_impure_ptr->_stdout` deref before `__sinit`
+
+**Symptom:** After fixing Bug A, `write(1, ...)` produces visible output, but `printf` and `puts` trap with mcause=5 (load access fault).
+
+**Root cause:** newlib's `_puts_r` dereferences `_impure_ptr->_stdout` (`ld s0, 16(a0)`) *before* checking the init flag and calling `__sinit`. Normally this works because `_impure_data._stdout` is compile-time initialized to point at the static `__sf[1]` FILE struct in .bss. In our link, anchoring `.htif` at `0x80001e00` perturbs the linker's address arithmetic enough that some pointer in `_impure_data` ends up pointing to unmapped memory.
+
+**Resolution shipped:** Bypass stdio entirely. Recovery uses `write()` (proven to work via direct htif_syscall path) with hand-written `say()` and `say_hex32()` helpers. This is also closer to what production secure-boot recovery firmware actually does — bare-metal code doesn't pull in newlib's stdio for safety/footprint reasons.
+
+#### Final verification
+
+Run output now contains all expected diagnostic lines:
+```
+[UART] UART0 is here (stdin/stdout).
+something went wrong, in recovery mode
+boot status register = 0x00000001
+  - check_manifest_header failed (bit 0)
+- TestDriver.v:158: Verilog $finish
+```
+And `sim_exit=0` (clean `$finish`, not `$stop`). Five independent PASS signals fire (kernel-banner-absent, recovery-banner-present, SR-value, stage-decode, clean-exit).
 
 ---
 
@@ -449,32 +483,34 @@ kernel started successfully rocket
 ```
 End-to-end clean: BootROM runs Stages 0 (magic), 1 (real OTP compare), 2 (stub), 4 (stub), 5 (clear_scratch + **real PMP lock**), then `mret`s to kernel. Kernel runs in M-mode with PMP isolating it from OTP and the rollback counter, prints success, exits via HTIF.
 
-**Negative test — tampered manifest header (`tests/test_tempering_manifest_header/`) — PASS strong, full mret path proven:**
+**Negative test — tampered manifest header (`tests/test_tempering_manifest_header/`) — PASS strong, full mret path proven with human-readable recovery diagnostic:**
 ```
 [UART] UART0 is here (stdin/stdout).
-*** FAILED *** (tohost = 65)
-[719445000] %Error: TestHarness.sv:99: Assertion failed: *** FAILED *** (exit code = 65)
-    at SimTSI.scala:21 assert(!error, "*** FAILED *** (exit code = %%d)\n", exit >> 1.U)
-%Error: TestHarness.sv:99: Verilog $stop
+something went wrong, in recovery mode
+boot status register = 0x00000001
+  - check_manifest_header failed (bit 0)
+- TestDriver.v:158: Verilog $finish
 ─────────────────────────────────────────
 PASS:
   ✓ kernel banner absent
-  ✓ FESVR exit code = 0x41 — BootROM mret succeeded, recovery main() reached, SR_MANIFEST_HEADER captured
+  ✓ recovery firmware reached (printed 'something went wrong, in recovery mode')
+  ✓ recovery confirmed SR = 0x00000001 (SR_MANIFEST_HEADER bit set)
+  ✓ recovery decoded failure as Stage 0 (check_manifest_header)
+  ✓ sim exited cleanly via $finish (sim_exit=0)
 ```
-A separate `TemperedSecureBootConfig` SoC was built with the SPI flash parameterized to read a manifest whose magic was flipped from `0x54424F53` ('SOBT') to `0x44414544` ('DEAD'). The exit code `0x41` (= 65) decodes as `0x40 | 0x01`:
-- `0x40` — marker bit set by `recovery_main()` as proof "I ran"
-- `0x01` — `SR_MANIFEST_HEADER` bit, read by recovery from MMIO `0xF0003000` and OR'd in
 
-The execution chain proven by this single integer:
+A separate `TemperedSecureBootConfig` SoC was built with the SPI flash parameterized to read a manifest whose magic was flipped from `0x54424F53` ('SOBT') to `0x44414544` ('DEAD').
+
+The execution chain proven by 5 independent log signals:
 1. BootROM Stage 0 detected the bad magic
-2. `enter_recovery(SR_MANIFEST_HEADER)` wrote `0x01` to the SR
-3. BootROM pre-armed `mtvec` to `mret_trap_exit` (safety net never fires — separate test path)
+2. `enter_recovery(SR_MANIFEST_HEADER)` wrote `0x01` to the SR (MMIO `0xF0003000`)
+3. BootROM pre-armed `mtvec` to `mret_trap_exit` safety stub (never fired — mret succeeded)
 4. BootROM `mret`'d to `0x80100000`
-5. Recovery's `_start` ran through the full htif_nano crt0 (FP init, TLS, BSS clear, `__libc_init_array`)
-6. Recovery's `main()` reached, read SR, OR'd in the `0x40` marker, encoded as exit syscall
-7. FESVR saw the tohost write, called `$stop` with the decoded exit code
-
-If any link in this chain were broken, we'd see a different exit code (0x80 = mret trapped, 0x01 = recovery main not reached, no exit code = sim hung in crt0).
+5. Recovery's `_start` ran the full htif_nano crt0 (FP init, TLS, BSS clear, `__libc_init_array`)
+6. Recovery's `main()` reached, read SR via MMIO, formatted the 4 diagnostic lines
+7. Each line written via `write(1, ...)` syscall → `htif_syscall` → `tohost = ptr_to_syscall_struct` at `0x80001e00`
+8. FESVR processed each syscall, printed the chars to host stdout
+9. `main()` returned 0 → `_exit(0)` → `tohost = 1` → FESVR called `$finish` cleanly
 
 ---
 
