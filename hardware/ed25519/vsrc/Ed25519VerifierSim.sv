@@ -11,11 +11,7 @@ module Ed25519VerifierSim (
     output reg  [31:0] count
 );
 
-  // Layout BootROM writes:
-  //   manifest  : 96 bytes
-  //   signature : 64 bytes
-  //   public key: 32 bytes
-  // total = 192 bytes
+  // bootrom writes manifest, signature, then public key
   reg [7:0] buffer [0:191];
 
   integer idx;
@@ -61,6 +57,7 @@ module Ed25519VerifierSim (
       end
 
       if (start) begin
+        $display("EDDBG start count=%0d idx=%0d", count, idx);
         status <= 32'h00000001; // busy
 
         if (idx != 192) begin
@@ -70,7 +67,9 @@ module Ed25519VerifierSim (
           write_file("/tmp/secureboot_ed_signature.bin", 96,  64);
           write_file("/tmp/secureboot_ed_public_key.bin",160, 32);
 
+          $display("EDDBG running host verifier");
           rc = $system("python3 \"$SECURE_BOOT_REPO/tools/verify_ed25519_from_files.py\" /tmp/secureboot_ed_manifest.bin /tmp/secureboot_ed_signature.bin /tmp/secureboot_ed_public_key.bin");
+          $display("EDDBG verifier rc=%0d", rc);
 
           if (rc == 0) begin
             status <= 32'h00000006; // done + pass

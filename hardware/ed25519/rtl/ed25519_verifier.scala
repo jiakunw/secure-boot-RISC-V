@@ -60,9 +60,7 @@ class SecureBootEd25519TL(params: SecureBootEd25519Params, beatBytes: Int)(impli
       verifier.io.data_word := dataWord
 
       node.regmap(
-        // command:
-        //   bit 0 = clear/reset byte counter/status
-        //   bit 1 = start verification
+        // command bits: clear and start
         0x00 -> Seq(RegField.w(32, RegWriteFn { (valid, data) =>
           when (valid) {
             clearPulse := data(0)
@@ -71,18 +69,13 @@ class SecureBootEd25519TL(params: SecureBootEd25519Params, beatBytes: Int)(impli
           true.B
         })),
 
-        // status:
-        //   bit 0 = busy
-        //   bit 1 = done
-        //   bit 2 = pass
-        //   bit 3 = error
+        // verifier status bits
         0x04 -> Seq(RegField.r(32, verifier.io.status)),
 
-        // number of bytes received by verifier
+        // bytes written so far
         0x08 -> Seq(RegField.r(32, verifier.io.count)),
 
-        // data FIFO:
-        // BootROM writes manifest, signature, public key as 32-bit words.
+        // data words from bootrom
         0x0c -> Seq(RegField.w(32, RegWriteFn { (valid, data) =>
           when (valid) {
             dataPulse := true.B
