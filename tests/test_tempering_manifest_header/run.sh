@@ -35,9 +35,13 @@ cd "$CHIPYARD_HOME/sims/verilator"
 # FESVR loads ONLY the first positional ELF (targs[0]). Extra ELFs must
 # be passed via the `+payload=<path>` plusarg, which goes through FESVR's
 # `payloads` list and gets loaded in addition to the primary kernel.
-# 300s timeout: sim wall-clock for tempered case is typically 1-4 min
-# depending on Verilator build optimization level. 30s is too short.
-timeout 300 stdbuf -oL "$SIM" "+payload=$RECOVERY" "$KERNEL" > "$LOG" 2>&1
+# Do NOT use `stdbuf -oL`: the Verilator-generated sim uses C++ iostreams
+# which are incompatible with libstdbuf's stdio override (LD_PRELOAD'd).
+# Do NOT wrap with `timeout`: combining timeout + file redirect somehow
+# loses sim's output to the redirect file (cause unclear; reproducible).
+# If sim hangs, kill manually or wrap the whole `bash run.sh` invocation
+# with an outer `timeout 360`.
+"$SIM" "+payload=$RECOVERY" "$KERNEL" > "$LOG" 2>&1
 SIM_EXIT=$?
 echo "sim exit code: $SIM_EXIT  (kernel-success → 0; tohost-exit path → 255 with SoC exit code in log)"
 
