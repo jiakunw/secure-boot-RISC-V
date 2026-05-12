@@ -105,6 +105,57 @@ typedef struct __attribute__((packed)) {
     uint8_t next_pubkey_hash[32];
 } manifest_t;
 
+
+/* rollback + PMP implementation constants */
+
+#ifndef ROLLBACK_COUNTER_BASE
+#define ROLLBACK_COUNTER_BASE 0xF0001000UL
+#endif
+
+#ifndef SR_ROLLBACK_COUNTER
+#ifdef SR_ROLLBACK
+#define SR_ROLLBACK_COUNTER SR_ROLLBACK
+#else
+#define SR_ROLLBACK_COUNTER (1u << 4)
+#endif
+#endif
+
+#ifndef SR_PMP_LOCK
+#ifdef SR_PMP
+#define SR_PMP_LOCK SR_PMP
+#else
+#define SR_PMP_LOCK (1u << 5)
+#endif
+#endif
+
+/*
+ * PMP regions used at handoff.
+ *
+ * BootROM is locked X-only, not no-access, because the CPU is still fetching
+ * from BootROM while these CSRs are programmed. OTP/rollback/SPI/status/Ed
+ * verifier are locked no-access as one secure MMIO window. DRAM is locked RWX
+ * so the verified kernel can run normally.
+ */
+#define BOOTROM_PROTECT_BASE       0x00010000UL
+#define BOOTROM_PROTECT_SIZE       0x00010000UL
+
+#define SECURE_MMIO_PROTECT_BASE   0xF0000000UL
+#define SECURE_MMIO_PROTECT_SIZE   0x00010000UL
+
+#define DRAM_PROTECT_BASE          0x80000000UL
+#define DRAM_PROTECT_SIZE          0x10000000UL
+
+#define PMP_R                      0x01UL
+#define PMP_W                      0x02UL
+#define PMP_X                      0x04UL
+#define PMP_A_NAPOT                0x18UL
+#define PMP_L                      0x80UL
+
+#define PMP_CFG_LOCKED_X_ONLY      (PMP_L | PMP_A_NAPOT | PMP_X)
+#define PMP_CFG_LOCKED_NO_ACCESS   (PMP_L | PMP_A_NAPOT)
+#define PMP_CFG_LOCKED_RWX         (PMP_L | PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
+
+
 static void halt(void)
 {
     while (1) {
@@ -460,16 +511,118 @@ static void check_and_load_kernel(const manifest_t *manifest)
 
 
 /* INCREMENT 4: Stage 4 stubbed (will re-enable in INCREMENT 6). */
-static void check_rollback_counter(const manifest_t *manifest)
+
+static uintptr_t pmp_napot_addr(uintptr_t base, uintptr_t size)
 {
-    (void)manifest;
-    /* Stage 4 rollback compare disabled until INCREMENT 6:
-     * uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
-     * uint64_t version = (uint64_t)manifest->version;
-     * if (version < counter) halt();
-     * if (version > counter) write_register64(ROLLBACK_COUNTER_BASE, version);
-     */
+    return (base >> 2) | ((size >> 3) - 1);
 }
+
+static void csr_write_pmpaddr0(uintptr_t value)
+{
+    asm volatile ("csrw pmpaddr0, %0" :: "r"(value) : "memory");
+}
+
+static void csr_write_pmpaddr1(uintptr_t value)
+{
+    asm volatile ("csrw pmpaddr1, %0" :: "r"(value) : "memory");
+}
+
+static void csr_write_pmpaddr2(uintptr_t value)
+{
+    asm volatile ("csrw pmpaddr2, %0" :: "r"(value) : "memory");
+}
+
+static uintptr_t csr_read_pmpaddr0(void)
+{
+    uintptr_t value;
+    asm volatile ("csrr %0, pmpaddr0" : "=r"(value));
+    return value;
+}
+
+static uintptr_t csr_read_pmpaddr1(void)
+{
+    uintptr_t value;
+    asm volatile ("csrr %0, pmpaddr1" : "=r"(value));
+    return value;
+}
+
+static uintptr_t csr_read_pmpaddr2(void)
+{
+    uintptr_t value;
+    asm volatile ("csrr %0, pmpaddr2" : "=r"(value));
+    return value;
+}
+
+static void csr_write_pmpcfg0(uintptr_t value)
+{
+    asm volatile ("csrw pmpcfg0, %0" :: "r"(value) : "memory");
+}
+
+static uintptr_t csr_read_pmpcfg0(void)
+{
+    uintptr_t value;
+    asm volatile ("csrr %0, pmpcfg0" : "=r"(value));
+    return value;
+}
+
+static void boot_fence_all(void)
+{
+    asm volatile ("fence" ::: "memory");
+    asm volatile ("fence.i" ::: "memory");
+}
+
+
+
+static void secure_memzero(void *ptr, uint32_t n)
+{
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+
+    for (uint32_t i = 0; i < n; i++) {
+        p[i] = 0;
+    }
+}
+
+static void clear_boot_scratch(void)
+{
+    secure_memzero(MANIFEST_BUFFER, MANIFEST_SIZE);
+    secure_memzero(SIGNATURE_BUFFER, SIGNATURE_SIZE);
+    secure_memzero(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE);
+    secure_memzero(PUBLIC_KEY_HASH, SHA256_DIGEST_SIZE);
+    secure_memzero(OTP_HASH_BUFFER, SHA256_DIGEST_SIZE);
+    secure_memzero(KERNEL_HASH_BUFFER, SHA256_DIGEST_SIZE);
+    secure_memzero(KERNEL_CHUNK, KERNEL_CHUNK_SIZE);
+}
+
+
+static int check_rollback_counter(const manifest_t *manifest)
+{
+    uint64_t stored_version = read_register64(ROLLBACK_COUNTER_BASE);
+    uint64_t image_version = (uint64_t)manifest->version;
+
+    if (image_version < stored_version) {
+        enter_recovery(SR_ROLLBACK_COUNTER);
+        return -1;
+    }
+
+    if (image_version > stored_version) {
+        write_register64(ROLLBACK_COUNTER_BASE, image_version);
+
+        /*
+         * The hardware counter is monotonic: it should either advance to the
+         * requested version or already contain a newer value. Anything below
+         * image_version means rollback protection did not latch correctly.
+         */
+        uint64_t updated_version = read_register64(ROLLBACK_COUNTER_BASE);
+
+        if (updated_version < image_version) {
+            enter_recovery(SR_ROLLBACK_COUNTER);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 
 /* pmp uses napot encoding for locked regions */
 static uint64_t make_napot(uint64_t base, uint64_t size)
@@ -479,69 +632,46 @@ static uint64_t make_napot(uint64_t base, uint64_t size)
 
 /* Stage 5: lock OTP / counter / BootROM with PMP.
  * BootROM stays RX so the handoff code can still run after the lock. */
-static void lock_pmp(void)
+static int lock_pmp(void)
 {
-    /* Pre-mark "lock_pmp failure" in SR. Set before the trap-causing
-     * csrw so the recovery image sees it. We can't easily clear it on
-     * the success path because the trap fires before we'd reach a clear
-     * line, but recovery is only invoked on failure anyway. */
-    set_status(SR_LOCK_PMP);
+    uintptr_t bootrom_addr = pmp_napot_addr(BOOTROM_PROTECT_BASE, BOOTROM_PROTECT_SIZE);
+    uintptr_t secure_mmio_addr = pmp_napot_addr(SECURE_MMIO_PROTECT_BASE, SECURE_MMIO_PROTECT_SIZE);
+    uintptr_t dram_addr = pmp_napot_addr(DRAM_PROTECT_BASE, DRAM_PROTECT_SIZE);
 
-    /* Redirect M-mode traps to the recovery firmware entry point. */
-    __asm__ volatile (
-        "li t0, %0\n"
-        "csrw mtvec, t0\n"
-        :
-        : "i"(RECOVERY_ENTRY)
-        : "t0", "memory"
-    );
+    uintptr_t cfg =
+        ((uintptr_t)PMP_CFG_LOCKED_X_ONLY    << 0)  |
+        ((uintptr_t)PMP_CFG_LOCKED_NO_ACCESS << 8)  |
+        ((uintptr_t)PMP_CFG_LOCKED_RWX       << 16);
 
-    uint64_t pmpaddr0 = make_napot(BOOTROM_BASE, BOOTROM_SIZE);
-    uint64_t pmpaddr1 = make_napot(OTP_BASE, OTP_SIZE);
-    uint64_t pmpaddr2 = make_napot(ROLLBACK_COUNTER_BASE, ROLLBACK_COUNTER_SIZE);
-    uint64_t pmpaddr3 = make_napot(0x0ULL, 1ULL << 54);
+    /*
+     * Program addresses first, then lock the config.
+     * Once L is set in pmpcfg0, these entries cannot be changed until reset.
+     */
+    csr_write_pmpaddr0(bootrom_addr);
+    csr_write_pmpaddr1(secure_mmio_addr);
+    csr_write_pmpaddr2(dram_addr);
 
-    /* PMP entry 0: BootROM region — RX (M-mode can still execute the
-     *               remaining BootROM instructions including the mret to
-     *               kernel). Write/exec from S/U-mode denied.
-     * PMP entry 1: OTP — NO_ACCESS for everyone (we don't touch OTP after
-     *               this point; locked from kernel).
-     * PMP entry 2: Rollback counter — NO_ACCESS (likewise).
-     * PMP entry 3: catch-all RWX — kernel + DRAM accessible. */
-    uint64_t pmpcfg0 =
-        ((uint64_t)PMP_LOCK_NAPOT_RX        << 0)  |   /* BootROM: RX */
-        ((uint64_t)PMP_LOCK_NAPOT_NO_ACCESS << 8)  |
-        ((uint64_t)PMP_LOCK_NAPOT_NO_ACCESS << 16) |
-        ((uint64_t)PMP_LOCK_NAPOT_RWX       << 24) |
-        ((uint64_t)PMP_LOCK_OFF             << 32) |
-        ((uint64_t)PMP_LOCK_OFF             << 40) |
-        ((uint64_t)PMP_LOCK_OFF             << 48) |
-        ((uint64_t)PMP_LOCK_OFF             << 56);
+    boot_fence_all();
 
-    uint64_t pmpcfg2 =
-        ((uint64_t)PMP_LOCK_OFF << 0)  |
-        ((uint64_t)PMP_LOCK_OFF << 8)  |
-        ((uint64_t)PMP_LOCK_OFF << 16) |
-        ((uint64_t)PMP_LOCK_OFF << 24) |
-        ((uint64_t)PMP_LOCK_OFF << 32) |
-        ((uint64_t)PMP_LOCK_OFF << 40) |
-        ((uint64_t)PMP_LOCK_OFF << 48) |
-        ((uint64_t)PMP_LOCK_OFF << 56);
+    csr_write_pmpcfg0(cfg);
 
-    __asm__ volatile ("csrw pmpaddr0, %0" :: "r"(pmpaddr0));
-    __asm__ volatile ("csrw pmpaddr1, %0" :: "r"(pmpaddr1));
-    __asm__ volatile ("csrw pmpaddr2, %0" :: "r"(pmpaddr2));
-    __asm__ volatile ("csrw pmpaddr3, %0" :: "r"(pmpaddr3));
+    boot_fence_all();
 
-    __asm__ volatile ("csrw pmpcfg2, %0" :: "r"(pmpcfg2));
-    __asm__ volatile ("csrw pmpcfg0, %0" :: "r"(pmpcfg0));
+    if (csr_read_pmpaddr0() != bootrom_addr ||
+        csr_read_pmpaddr1() != secure_mmio_addr ||
+        csr_read_pmpaddr2() != dram_addr) {
+        enter_recovery(SR_PMP_LOCK);
+        return -1;
+    }
 
-    /* PMP commit succeeded (BootROM entry is RX, so the next fetch is
-     * allowed). Clear the tentative SR_LOCK_PMP bit we set above so the
-     * status register accurately reflects "no failures". */
-    uint32_t cur = *(volatile uint32_t *)BOOT_STATUS_REG;
-    *(volatile uint32_t *)BOOT_STATUS_REG = cur & ~SR_LOCK_PMP;
+    if ((csr_read_pmpcfg0() & 0x00ffffffUL) != (cfg & 0x00ffffffUL)) {
+        enter_recovery(SR_PMP_LOCK);
+        return -1;
+    }
+
+    return 0;
 }
+
 
 /* clears scratch data before leaving bootrom */
 static void clear_scratch(void)
@@ -586,13 +716,19 @@ void bootrom_main(void)
     check_manifest_signature();
     check_and_load_kernel(manifest);
 
-    check_rollback_counter(manifest);
+    if (check_rollback_counter(manifest) != 0) {
+        enter_recovery(SR_ROLLBACK_COUNTER);
+    }
 
     entry_point = manifest->entry_point;
 
     clear_scratch();
-    lock_pmp();
+    if (lock_pmp() != 0) {
+        enter_recovery(SR_PMP_LOCK);
+    }
 
+    clear_boot_scratch();
+    boot_fence_all();
     jump_to_kernel(entry_point);
     halt();
 }

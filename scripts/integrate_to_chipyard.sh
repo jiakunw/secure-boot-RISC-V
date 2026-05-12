@@ -200,28 +200,8 @@ fi
 # ─────────────────────────────────────────────
 echo ""
 echo ""
-echo "[1b/5] Generating Ed25519 public-key lookup table..."
-if [ ! -f "$MYREPO/tools/generate_ed25519_lut.py" ]; then
-    echo "Error: missing $MYREPO/tools/generate_ed25519_lut.py"
-    exit 1
-fi
+echo "[1b/5] Ed25519 verifier uses peripheral path; no BootROM LUT generation needed."
 
-if [ ! -f "$MYREPO/metadata/public_key.bin" ]; then
-    echo "Error: missing $MYREPO/metadata/public_key.bin"
-    exit 1
-fi
-
-python3 "$MYREPO/tools/generate_ed25519_lut.py"
-
-if [ ! -f "$MYREPO/software/crypto/include/secureboot_ed25519_lut.h" ]; then
-    echo "Error: LUT header was not generated"
-    exit 1
-fi
-
-grep -q "SECUREBOOT_PUBLIC_KEY_LUT_SIZE 64" "$MYREPO/software/crypto/include/secureboot_ed25519_lut.h" || {
-    echo "Error: LUT header does not contain 64-entry table size"
-    exit 1
-}
 
 echo "[2/5] Building BootROM..."
 if [ -f "$MYREPO/software/bootrom/Makefile" ]; then
