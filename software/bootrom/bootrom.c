@@ -55,7 +55,7 @@
 
 #define DRAM_BASE 0x80000000UL
 
-#define BOOT_SCRATCH_BASE 0x88000000UL
+#define BOOT_SCRATCH_BASE 0x81000000UL
 
 #define MANIFEST_BUFFER    ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0000u))
 #define SIGNATURE_BUFFER   ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0100u))
@@ -66,6 +66,7 @@
 #define KERNEL_CHUNK       ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0400u))
 
 #define KERNEL_CHUNK_SIZE 512u
+#define MAX_SPIN 10000000u
 
 #define PMP_LOCK_NAPOT_NO_ACCESS 0x98u   /* L=1, NAPOT, ---  */
 #define PMP_LOCK_NAPOT_RX        0x9Du   /* L=1, NAPOT, R-X  (M-mode can execute) */
@@ -253,16 +254,24 @@ static void read_flash_words(uint8_t *output_buffer, uint32_t total_bytes)
 {
     uint32_t bytes_read = 0;
 
+    uint32_t spin = 0;
+
     while (bytes_read < total_bytes) {
         uint32_t status = read_register(SPI_STATUS);
 
         if ((status & SPI_ERROR) != 0) {
-            halt();
+            enter_recovery(SR_LOAD_KERNEL);
         }
 
         if ((status & SPI_DATA_READY) == 0) {
+            spin++;
+            if (spin > MAX_SPIN) {
+                enter_recovery(SR_LOAD_KERNEL);
+            }
             continue;
         }
+
+        spin = 0;
 
         uint32_t word = read_register(SPI_DATA);
 
@@ -272,7 +281,12 @@ static void read_flash_words(uint8_t *output_buffer, uint32_t total_bytes)
         }
     }
 
+    spin = 0;
     while ((read_register(SPI_STATUS) & SPI_DONE) == 0) {
+        spin++;
+        if (spin > MAX_SPIN) {
+            enter_recovery(SR_LOAD_KERNEL);
+        }
     }
 }
 
@@ -341,13 +355,11 @@ static void check_manifest_signature(void)
      */
 }
 
-/* Stage 3: read the kernel from flash, hash it, copy to DRAM. Currently
- * NOT called from bootrom_main (multi-transaction SPI bug under
- * investigation), but logic kept current so it's ready when fixed. */
+/* Stage 3: read the whole kernel from flash into DRAM.
+ * One SPI transaction avoids the old repeated-read hang.
+ * Hash the DRAM copy because those are the bytes we jump into. */
 static void check_and_load_kernel(const manifest_t *manifest)
 {
-    sha256_ctx ctx;
-    uint32_t copied = 0;
     uint8_t *kernel_output = (uint8_t *)(uintptr_t)manifest->load_address;
 
     if (manifest->payload_size == 0) {
@@ -358,25 +370,28 @@ static void check_and_load_kernel(const manifest_t *manifest)
         enter_recovery(SR_LOAD_KERNEL);
     }
 
-    sha256_init(&ctx);
+    /*
+     * Read the whole kernel in one SPI transaction.
+     *
+     * The old version did many 512-byte SPI transactions. That keeps the
+     * secure-boot behavior correct in theory, but it stresses the SPI
+     * start/done handshake and can hang before the kernel handoff.
+     *
+     * This still follows the README flow:
+     *   flash kernel -> DRAM load_address
+     *   hash loaded kernel
+     *   compare hash to manifest
+     *   only then jump
+     */
+    read_flash(KERNEL_OFFSET, manifest->payload_size, kernel_output);
 
-    while (copied < manifest->payload_size) {
-        uint32_t left = manifest->payload_size - copied;
-        uint32_t chunk_size = left < KERNEL_CHUNK_SIZE ? left : KERNEL_CHUNK_SIZE;
-
-        read_flash(KERNEL_OFFSET + copied, chunk_size, KERNEL_CHUNK);
-        sha256_update(&ctx, KERNEL_CHUNK, chunk_size);
-        copy_bytes(kernel_output + copied, KERNEL_CHUNK, chunk_size);
-
-        copied += chunk_size;
-    }
-
-    sha256_final(&ctx, KERNEL_HASH_BUFFER);
+    sha256_hash(kernel_output, manifest->payload_size, KERNEL_HASH_BUFFER);
 
     if (!same_bytes(KERNEL_HASH_BUFFER, manifest->payload_hash, SHA256_DIGEST_SIZE)) {
         enter_recovery(SR_LOAD_KERNEL);
     }
 }
+
 
 /* INCREMENT 4: Stage 4 stubbed (will re-enable in INCREMENT 6). */
 static void check_rollback_counter(const manifest_t *manifest)
@@ -396,18 +411,8 @@ static uint64_t make_napot(uint64_t base, uint64_t size)
     return (base >> 2) | ((size - 1) >> 3);
 }
 
-/* Stage 5: lock OTP / Counter / BootROM via PMP.
- *
- * The PMP config below uses NO_ACCESS+L=1 for the BootROM region. RISC-V
- * spec says L=1 extends PMP enforcement to M-mode, so the very next
- * instruction fetch (which still comes from the BootROM region we just
- * locked) will trigger an instruction-access fault.
- *
- * Instead of letting that fault loop forever, we PRE-ARM mtvec to point
- * at the recovery firmware entry. When the fetch faults, the CPU traps
- * to mtvec → recovery runs. We also pre-mark SR_LOCK_PMP in the status
- * register so recovery can report exactly which stage caused the trap.
- */
+/* Stage 5: lock OTP / counter / BootROM with PMP.
+ * BootROM stays RX so the handoff code can still run after the lock. */
 static void lock_pmp(void)
 {
     /* Pre-mark "lock_pmp failure" in SR. Set before the trap-causing
@@ -485,17 +490,19 @@ static void clear_scratch(void)
 }
 
 /* jumps into the verified kernel */
-static void jump_to_kernel(uint32_t entry_point)
+static void jump_to_kernel(uintptr_t entry_point)
 {
     __asm__ volatile (
         "fence\n"
         "fence.i\n"
         "csrw mepc, %0\n"
+        "li t0, 0x1800\n"
+        "csrs mstatus, t0\n"
         "csrr a0, mhartid\n"
         "li a1, 0\n"
         "mret\n"
         :
-        : "r"((uintptr_t)entry_point)
+        : "r"(entry_point)
         : "a0", "a1", "memory"
     );
 
@@ -505,23 +512,19 @@ static void jump_to_kernel(uint32_t entry_point)
 void bootrom_main(void)
 {
     manifest_t *manifest = (manifest_t *)MANIFEST_BUFFER;
-    uint32_t entry_point;
+    uintptr_t entry_point;
 
     read_boot_parts();
     check_manifest_header(manifest);
     check_public_key();
     check_manifest_signature();
-    /* check_and_load_kernel(manifest);  -- bisection showed bug in this fn; skip for now */
+    check_and_load_kernel(manifest);
 
     check_rollback_counter(manifest);
 
-    entry_point = 0x80000000u;              /* FESVR pre-loaded kernel here */
+    entry_point = manifest->entry_point;
 
     clear_scratch();
-    /* lock_pmp will self-fault on the next instruction fetch (we lock the
-     * BootROM region with NO_ACCESS+L=1, and L=1 enforces against M-mode).
-     * lock_pmp now pre-arms mtvec=RECOVERY_ENTRY before writing PMP, so the
-     * fault traps into the recovery firmware instead of looping forever. */
     lock_pmp();
 
     jump_to_kernel(entry_point);

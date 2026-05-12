@@ -83,19 +83,6 @@ if [ -n "$SV_SOURCES" ]; then
 fi
 
 echo ""
-echo "[1b/5] Preparing flash image hex..."
-if [ -f "$MYREPO/tools/flash_image_to_hex.py" ] && [ -f "$MYREPO/flash_image/flash_image.bin" ]; then
-    python3 "$MYREPO/tools/flash_image_to_hex.py" \
-        --input "$MYREPO/flash_image/flash_image.bin" \
-        --output "$MYREPO/flash_image/flash_image.hex"
-    mkdir -p "$CHIPYARD/sims/verilator/flash_image"
-    cp "$MYREPO/flash_image/flash_image.hex" "$CHIPYARD/sims/verilator/flash_image/"
-    echo "  Copied flash_image.hex for Verilator elaboration."
-else
-    echo "  (No flash image converter/input found, skipping)"
-fi
-
-echo ""
 echo "[1c/5] Patching Chipyard DigitalTop for secure boot peripherals (OTP + Rollback + SPI + Status Register)..."
 DIGITAL_TOP=$CHIPYARD/generators/chipyard/src/main/scala/DigitalTop.scala
 if [ -f "$DIGITAL_TOP" ]; then
@@ -213,21 +200,41 @@ cmake -S "$TESTS_DIR" -B "$TESTS_DIR/build" -D CMAKE_BUILD_TYPE=Debug
 
 cmake --build "$TESTS_DIR/build" --target kernel
 
+# Chipyard may place the final ELF in $TESTS_DIR instead of $TESTS_DIR/build.
 ELF_PATH="$TESTS_DIR/build/kernel.riscv"
+if [ ! -f "$ELF_PATH" ] && [ -f "$TESTS_DIR/kernel.riscv" ]; then
+    ELF_PATH="$TESTS_DIR/kernel.riscv"
+fi
+
 BIN_PATH="$TESTS_DIR/build/kernel.bin"
 KERNEL_REPO_DIR="$MYREPO/software/kernel"
 
 if [ -f "$ELF_PATH" ]; then
-    echo "  Extracting kernel.bin..."
+    echo "  Extracting kernel.bin from $ELF_PATH..."
     riscv64-unknown-elf-objcopy -O binary "$ELF_PATH" "$BIN_PATH"
 
-    cp "$ELF_PATH" "$KERNEL_REPO_DIR/"
-    cp "$BIN_PATH" "$KERNEL_REPO_DIR/"
+    cp "$ELF_PATH" "$KERNEL_REPO_DIR/kernel.riscv"
+    cp "$BIN_PATH" "$KERNEL_REPO_DIR/kernel.bin"
     echo "  Success: kernel.riscv + kernel.bin copied to $KERNEL_REPO_DIR/"
 else
-    echo "  Error: kernel.riscv was not built successfully"
+    echo "  Error: kernel.riscv was not found after CMake build"
+    echo "  Checked: $TESTS_DIR/build/kernel.riscv"
+    echo "  Checked: $TESTS_DIR/kernel.riscv"
     exit 1
 fi
+
+echo "  Regenerating manifest, signature, and flash image from the rebuilt kernel..."
+(
+    cd "$MYREPO/tools"
+    python3 manifest_generators.py
+    python3 sign_firmware.py
+    python3 flash_image_to_hex.py \
+        --input "$MYREPO/flash_image/flash_image.bin" \
+        --output "$MYREPO/flash_image/flash_image.hex"
+)
+mkdir -p "$CHIPYARD/sims/verilator/flash_image"
+cp "$MYREPO/flash_image/flash_image.hex" "$CHIPYARD/sims/verilator/flash_image/"
+echo "  Success: flash_image.hex staged for Verilator runtime reads."
 
 # Build recovery firmware standalone via its own Makefile (custom linker
 # script recovery.ld placing it at 0x80100000).

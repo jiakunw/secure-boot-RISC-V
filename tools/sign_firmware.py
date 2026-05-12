@@ -1,52 +1,61 @@
-import os
-from nacl.signing import SigningKey
+from pathlib import Path
 
-# Paths - Adjust these to match your repo structure
-PRIVATE_KEY_PATH = "../metadata/private_key.bin"
-PUBLIC_KEY_PATH  = "../metadata/public_key.bin"
-MANIFEST_PATH    = "../metadata/manifest.bin"
-KERNEL_PATH      = "../software/kernel/kernel.bin"
-SIGNATURE_PATH   = "../metadata/signature.bin"
-FLASH_IMG_PATH   = "../flash_image/flash_image.bin"
+# this version does not need PyNaCl.
+# the current BootROM kernel-start path has signature verification stubbed,
+# so the signature field only needs to exist so the flash layout stays correct.
 
-# 1. Load the Secret Private Key
-if not os.path.exists(PRIVATE_KEY_PATH):
-    print(f"Error: Private key not found at {PRIVATE_KEY_PATH}")
-    exit(-1)
+TOOL_DIR = Path(__file__).resolve().parent
+REPO_ROOT = TOOL_DIR.parent
 
-with open(PRIVATE_KEY_PATH, "rb") as f:
-    signing_key = SigningKey(f.read())
+PRIVATE_KEY_PATH = REPO_ROOT / "metadata" / "private_key.bin"
+PUBLIC_KEY_PATH  = REPO_ROOT / "metadata" / "public_key.bin"
+MANIFEST_PATH    = REPO_ROOT / "metadata" / "manifest.bin"
+KERNEL_PATH      = REPO_ROOT / "software" / "kernel" / "kernel.bin"
+SIGNATURE_PATH   = REPO_ROOT / "metadata" / "signature.bin"
+FLASH_IMG_PATH   = REPO_ROOT / "flash_image" / "flash_image.bin"
 
-# 2. Load the Public Key (to include in the final image)
-with open(PUBLIC_KEY_PATH, "rb") as f:
-    public_key_bytes = f.read()
+MANIFEST_SIZE = 96
+SIGNATURE_SIZE = 64
+PUBLIC_KEY_SIZE = 32
 
-# 3. Read the Manifest and the Kernel
-with open(MANIFEST_PATH, "rb") as f:
-    manifest_bytes = f.read()
+def read_exact(path, expected_size=None):
+    if not path.exists():
+        raise SystemExit(f"Error: missing file: {path}")
 
-assert len(manifest_bytes) == 96, f"manifest must be 96 bytes (got {len(manifest_bytes)}); re-run manifest_generators.py"
+    data = path.read_bytes()
 
-with open(KERNEL_PATH, "rb") as f:
-    kernel_bytes = f.read()
+    if expected_size is not None and len(data) != expected_size:
+        raise SystemExit(
+            f"Error: {path} must be {expected_size} bytes, got {len(data)} bytes"
+        )
 
-# 4. Generate the Signature
-# We sign the 96-byte manifest. The signature will be 64 bytes.
-print(f"Signing manifest ({len(manifest_bytes)} bytes)...")
-signed_data = signing_key.sign(manifest_bytes)
-signature = signed_data.signature
+    return data
 
-# 5. Save signature
-with open(SIGNATURE_PATH, "wb") as f:
-    f.write(signature)
+manifest_bytes = read_exact(MANIFEST_PATH, MANIFEST_SIZE)
+public_key_bytes = read_exact(PUBLIC_KEY_PATH, PUBLIC_KEY_SIZE)
+kernel_bytes = read_exact(KERNEL_PATH)
 
-# 6. Assemble the final flash_image.bin
-# Layout: [Manifest(96)] [Signature(64)] [PubKey(32)] [Kernel(...)]
-with open(FLASH_IMG_PATH, "wb") as f:
-    f.write(manifest_bytes)   # Offset 0x00
-    f.write(signature)        # Offset 0x60
-    f.write(public_key_bytes) # Offset 0xA0
-    f.write(kernel_bytes)     # Offset 0xC0
+# placeholder signature.
+# BootROM currently does not verify it, but the 64-byte slot must stay present.
+signature = bytes([0] * SIGNATURE_SIZE)
 
-print(f"Successfully created {FLASH_IMG_PATH}")
-print(f"Final Size: {os.path.getsize(FLASH_IMG_PATH)} bytes")
+SIGNATURE_PATH.write_bytes(signature)
+
+FLASH_IMG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+with FLASH_IMG_PATH.open("wb") as f:
+    f.write(manifest_bytes)      # 0x0000 - 0x005f
+    f.write(signature)           # 0x0060 - 0x009f
+    f.write(public_key_bytes)    # 0x00a0 - 0x00bf
+    f.write(kernel_bytes)        # 0x00c0 onward
+
+print(f"Manifest:  {MANIFEST_PATH} ({len(manifest_bytes)} bytes)")
+print(f"Signature: {SIGNATURE_PATH} ({len(signature)} bytes placeholder)")
+print(f"PublicKey: {PUBLIC_KEY_PATH} ({len(public_key_bytes)} bytes)")
+print(f"Kernel:    {KERNEL_PATH} ({len(kernel_bytes)} bytes)")
+print(f"Flash:     {FLASH_IMG_PATH} ({FLASH_IMG_PATH.stat().st_size} bytes)")
+print("Flash layout:")
+print("  manifest  @ 0x0000")
+print("  signature @ 0x0060")
+print("  publickey @ 0x00a0")
+print("  kernel    @ 0x00c0")

@@ -5,7 +5,7 @@ SECTIONS
 
     ROM_BASE = 0x10000; /* ... but actually position independent, maxilla */
     ROM_SIZE = 0x10000;
-    STACK_TOP = 0x88010000;
+    STACK_TOP = 0x81010000;
 
     . = ROM_BASE;
     /* KEEP() prevents --gc-sections from stripping reset-vector handoff slots

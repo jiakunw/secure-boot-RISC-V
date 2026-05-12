@@ -202,7 +202,7 @@ class SPIMasterCore extends Module {
   io.spi.mosi := mosiReg
   io.data.valid := state === sEmit
   io.data.bits := emitWord
-  io.busy := state =/= sIdle && state =/= sDone
+  io.busy := state =/= sIdle
   io.done := doneReg
   io.error := errorReg
   io.remainingBytes := bytesRemaining
