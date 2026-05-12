@@ -1,35 +1,46 @@
-#include <stdio.h>
 #include <stdint.h>
 
-/* Must match bootrom.c. */
+/* DIAGNOSTIC RECOVERY — no printf, no htif_nano runtime activity.
+ *
+ * Purpose: BootROM mret's here on verification failure. We want to prove
+ * recovery._start (the htif_nano crt0) completed and main() was reached,
+ * by exiting the sim with an exit code that encodes:
+ *   - 0x40 marker bit  ("recovery's main() was reached")
+ *   - SR contents      (which BootROM stage failed)
+ *
+ * If we see exit code 0x41 in tempered-manifest-header test:
+ *   recovery main() ran, crt0 was fine, the original printf-based
+ *   recovery was hanging in htif_nano's putc protocol, not in startup.
+ *
+ * If sim hangs:
+ *   recovery's crt0 hung somewhere before reaching main().
+ *
+ * If we see exit code 0x80:
+ *   BootROM's mret_trap_exit safety net fired — mret itself trapped,
+ *   recovery code never started.
+ */
+
 #define BOOT_STATUS_REG       0xF0003000UL
-#define SR_MANIFEST_HEADER    (1u << 0)
-#define SR_PUBLIC_KEY         (1u << 1)
-#define SR_MANIFEST_SIGNATURE (1u << 2)
-#define SR_LOAD_KERNEL        (1u << 3)
-#define SR_ROLLBACK_COUNTER   (1u << 4)
-#define SR_LOCK_PMP           (1u << 5)
+
+/* Match kernel.riscv's tohost address (forced via Makefile --defsym so the
+ * linker resolves recovery's references to the same address FESVR's
+ * htif_t watcher polls from kernel.riscv's symbol table). */
+#define KERNEL_TOHOST_ADDR    0x80001e00UL
 
 int main(void) {
-  uint32_t status = *(volatile uint32_t *)BOOT_STATUS_REG;
+    /* Read SR (MMIO — bypasses cache). */
+    uint32_t status = *(volatile uint32_t *)BOOT_STATUS_REG;
 
-  printf("something went wrong, in recovery mode\n");
-  printf("boot status register = 0x%08x\n", status);
+    /* Encode: low 6 bits = SR contents, bit 6 = "recovery main reached". */
+    uint64_t encoded = (uint64_t)(status | 0x40u);
+    uint64_t exit_val = (encoded << 1) | 1ULL;
 
-  if (status & SR_MANIFEST_HEADER)
-    printf("  - check_manifest_header failed (bit 0)\n");
-  if (status & SR_PUBLIC_KEY)
-    printf("  - check_public_key failed (bit 1) -- OTP root-of-trust mismatch\n");
-  if (status & SR_MANIFEST_SIGNATURE)
-    printf("  - check_manifest_signature failed (bit 2) -- Ed25519 invalid\n");
-  if (status & SR_LOAD_KERNEL)
-    printf("  - check_and_load_kernel failed (bit 3) -- kernel hash mismatch / bad params\n");
-  if (status & SR_ROLLBACK_COUNTER)
-    printf("  - check_rollback_counter failed (bit 4) -- version too old\n");
-  if (status & SR_LOCK_PMP)
-    printf("  - lock_pmp failed (bit 5)\n");
-  if (status == 0)
-    printf("  - (no bits set; BootROM jumped here without writing SR)\n");
+    volatile uint64_t *tohost   = (volatile uint64_t *)KERNEL_TOHOST_ADDR;
+    volatile uint64_t *fromhost = (volatile uint64_t *)(KERNEL_TOHOST_ADDR + 8);
 
-  return 0;
+    /* Same loop pattern as BootROM's enter_recovery and riscv-pk's _exit. */
+    for (;;) {
+        *fromhost = 0;
+        *tohost   = exit_val;
+    }
 }

@@ -116,37 +116,52 @@ static void set_status(uint32_t bit)
  * the sim ALWAYS exits cleanly on verification failure — even if the
  * recovery image isn't reachable (e.g., FESVR didn't load it via
  * `+payload=`, or recovery's own console is unreachable). */
-#define KERNEL_TOHOST_ADDR 0x80001e00UL
+
+/* Trap-exit safety stub. If mret-to-recovery in enter_recovery() traps
+ * (illegal instr at 0x80100000 because recovery isn't loaded, PMP fault,
+ * ...), CPU lands here via mtvec. Writes tohost with marker = 0x80 so
+ * the test runner can distinguish "mret trapped" from "recovery main
+ * reached" (0x40) and "BootROM-only exit" (0x00). */
+extern void mret_trap_exit(void) __attribute__((aligned(4), naked));
+__attribute__((naked, aligned(4)))
+void mret_trap_exit(void)
+{
+    __asm__ volatile (
+        "li   t0, 0x80001e08\n"
+        "li   t1, 0x80001e00\n"
+        "li   t2, 0x101\n"          /* (0x80 << 1) | 1 */
+        "1:\n"
+        "  sd t2, 0(t1)\n"
+        "  sd zero, 0(t0)\n"
+        "  j 1b\n"
+        ::: "t0", "t1", "t2", "memory"
+    );
+}
 
 /* On verification failure: record which stage failed in the SR, then
- * signal FESVR to exit by writing tohost in a loop (mimicking the exact
- * pattern in `_exit` from riscv-pk's htif_nano runtime, which is what
- * kernel.riscv uses when its main returns).
- *
- * Why a loop and not a single write? FESVR polls the simulated DRAM via
- * a path that doesn't snoop the CPU's L1 D-cache in real time. A single
- * `sd` to tohost sits dirty in L1 D$ and FESVR sees stale zero forever.
- * The kernel's _exit loops `*fromhost=0; *tohost=exit_val;` indefinitely
- * — the repeated writes create cache pressure that eventually evicts the
- * tohost line to DRAM, where FESVR sees it and calls $finish.
- *
- * Exit code encoding: tohost = (exit_code << 1) | 1. With reason_bit as
- * the exit code, the host-visible exit status is the SR bit number, so
- * `echo $?` after the sim tells you which stage failed.
- *
- * No-return: FESVR's $finish terminates the simulator inside this loop. */
+ * `mret` to the recovery firmware at 0x80100000. Safety net: mtvec
+ * pre-armed to mret_trap_exit so a faulting mret exits sim cleanly with
+ * a distinguishable code (0x80) instead of trapping back into _start
+ * and looping. */
 static __attribute__((noreturn)) void enter_recovery(uint32_t reason_bit)
 {
     set_status(reason_bit);
 
-    volatile uint64_t *tohost   = (volatile uint64_t *)KERNEL_TOHOST_ADDR;
-    volatile uint64_t *fromhost = (volatile uint64_t *)(KERNEL_TOHOST_ADDR + 8);
-    uint64_t exit_val = ((uint64_t)reason_bit << 1) | 1ULL;
+    __asm__ volatile (
+        "la   t0, mret_trap_exit\n"
+        "csrw mtvec, t0\n"
+        "fence\n"
+        "fence.i\n"
+        "csrw mepc, %0\n"
+        "csrr a0, mhartid\n"
+        "li   a1, 0\n"
+        "mret\n"
+        :
+        : "r"((uintptr_t)RECOVERY_ENTRY)
+        : "t0", "a0", "a1", "memory"
+    );
 
-    for (;;) {
-        *fromhost = 0;
-        *tohost   = exit_val;
-    }
+    __builtin_unreachable();
 }
 
 /* freestanding memset / memcpy for MonoCypher under -nostdlib; volatile pointers

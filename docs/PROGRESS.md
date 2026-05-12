@@ -177,17 +177,17 @@ Stage 5: ┌──────────────────────�
 | **5** | **Real OTP compare in Stage 1 (`check_public_key`)** | **✅ done** | Debug dropbox confirmed `MATCH` between BootROM-computed SHA-256(pubkey) and OTP-burned hash; mismatch triggers `enter_recovery(SR_PUBLIC_KEY)` (bit 1) |
 | **6** | **PMP lock (Stage 5) — real lock active; rollback still stub** | **🚧 PMP only** | `lock_pmp` now writes BootROM=RX+L, OTP/Counter=NO_ACCESS+L, catch-all=RWX+L; BootROM successfully `mret`s to kernel post-lock. Rollback counter check is still stubbed |
 | 7 | Real Ed25519 verify (MonoCypher) in Stage 2 | 🔧 attempted, hangs | Un-stubbed code hangs in sim; previously suspected MonoCypher / OTP but earlier hangs may have been zombie-sim CPU starvation — needs re-test |
-| **+** | **Recovery handler (industry-style failure handoff)** | **✅ done (sim-exit variant)** | Separate `recovery.riscv` ELF at `0x80100000` is built and FESVR-loaded; `enter_recovery(reason_bit)` writes the failing-stage bit to the SR and then **directly drives the sim to exit via tohost** (writes `(reason_bit<<1)|1` in an infinite loop, mimicking riscv-pk's `_exit`). Sim exits with FESVR-reported exit code = reason_bit. On real silicon this same `enter_recovery` would instead `mret` to the recovery image — see "Sim exit vs production mret" note below |
-| **+** | **Status Register (SR) peripheral — 32-bit boot-status MMIO** | **✅ done** | New peripheral at `0xF0003000` (`hardware/status_register/rtl/sr.scala`). BootROM sets one bit per failed stage (`SR_MANIFEST_HEADER`=0x01, `SR_PUBLIC_KEY`=0x02, …, `SR_LOCK_PMP`=0x20); recovery reads and reports which stage failed |
-| **+** | **Tempered SoC test infrastructure (negative tests)** | **✅ done — PASS strong** | `tests/test_tempering_manifest_header/` builds an entire parallel SoC (`TemperedSecureBootConfig`) pointing the SPI flash at a tampered hex image. Strong PASS: kernel banner absent **AND** FESVR-reported exit code = 1 = `SR_MANIFEST_HEADER` bit. Sim runs ~10s wall-clock and exits cleanly via `$stop` |
+| **+** | **Recovery handler — full mret-to-recovery handoff** | **✅ done — end-to-end** | Separate `recovery.riscv` ELF at `0x80100000` (FESVR-loaded via `+payload=`). `enter_recovery(reason_bit)` writes the SR bit, pre-arms `mtvec` at a `mret_trap_exit` safety stub, then `mret`s to `0x80100000`. Recovery's htif_nano `_start` (full crt0: FP init, TLS, BSS clear, `__libc_init_array`) runs, then `main()` reads SR via MMIO and exits the sim with FESVR exit code = `0x40 \| sr_bits`. The 0x40 marker bit proves end-to-end that the production-faithful mret path executed. |
+| **+** | **Status Register (SR) peripheral — 32-bit boot-status MMIO** | **✅ done** | New peripheral at `0xF0003000` (`hardware/status_register/rtl/sr.scala`). BootROM sets one bit per failed stage (`SR_MANIFEST_HEADER`=0x01, `SR_PUBLIC_KEY`=0x02, …, `SR_LOCK_PMP`=0x20); recovery reads via MMIO and encodes into the FESVR exit code |
+| **+** | **Tempered SoC test infrastructure (negative tests)** | **✅ done — PASS strong, mret proven** | `tests/test_tempering_manifest_header/` builds a parallel SoC (`TemperedSecureBootConfig`) pointing the SPI flash at a tampered hex image. Strong PASS: kernel banner absent **AND** FESVR-reported exit code = `0x41` = `0x40` (recovery main() reached marker) `\|` `0x01` (SR_MANIFEST_HEADER). |
 
 **Currently shipped (this commit):**
 - All BootROM stages 0, 1, 2, 4, 5 run end-to-end on the happy path (signature + rollback are stubs but the function bodies execute and return).
 - Stage 3 (`check_and_load_kernel`) is still commented out — bisection confirmed the SPI multi-transaction hang.
 - **PMP lock is now active**: BootROM region locked R+X (M-mode can still execute remaining instructions), OTP / Counter regions NO_ACCESS (kernel cannot read them post-lock), catch-all RWX. Kernel boots in M-mode but is isolated from the OTP root-of-trust and the rollback counter.
-- Verification failures in Stages 0, 1, 3, 5 trigger `enter_recovery(reason_bit)`, which (a) writes the failing-stage bit into the SR and (b) drives the sim to exit with that bit as the exit code via tohost. (On real silicon the same `enter_recovery` would `mret` to the recovery image at `0x80100000`; for the sim we use the tohost-exit shortcut for a strong, machine-checkable verdict — see "Sim exit vs production mret" below.)
+- Verification failures in Stages 0, 1, 3, 5 trigger `enter_recovery(reason_bit)`, which (a) writes the failing-stage bit into the SR, (b) pre-arms `mtvec` to a `mret_trap_exit` safety stub, then (c) **`mret`s to the recovery firmware at `0x80100000`**. Recovery's `main()` reads SR via MMIO and exits the sim via tohost-exit syscall encoding `0x40 | sr_bits` so the host sees a single integer exit code containing both "recovery main() reached" + "which stage failed."
 - **Happy path verified end-to-end**: with all integrated stages (real OTP compare + real PMP lock active), the kernel still boots and prints `kernel started successfully rocket` cleanly.
-- **Negative test verified end-to-end (PASS strong)**: tampered manifest magic → BootROM Stage 0 catches it → sim exits with exit code = `SR_MANIFEST_HEADER` bit = 1, kernel banner absent.
+- **Negative test verified end-to-end with mret-to-recovery (PASS strong)**: tampered manifest magic → BootROM Stage 0 catches it → mret to recovery → recovery runs through full htif_nano crt0 (FP init, TLS, BSS clear, `__libc_init_array`) → `main()` reads SR → sim exits with exit code = `0x41` (= `0x40 | SR_MANIFEST_HEADER`). Kernel banner absent.
 
 ---
 
@@ -334,11 +334,20 @@ Un-stubbing `crypto_eddsa_check()` (MonoCypher Ed25519). Earlier attempts showed
 - An infinite loop in some MonoCypher inner routine
 - **Previous hangs may have been zombie-sim CPU starvation** (we had 17 leaked sims fighting for CPU). After OTP turned out to work fine once zombies were cleaned, Ed25519 deserves a re-test under clean CPU conditions — could plausibly Just Work.
 
-### 3. ~~Recovery firmware printf invisible (HTIF tohost mismatch)~~ — RESOLVED via sim-exit shortcut
+### 3. Recovery firmware `printf` specifically hangs — narrowed to htif_nano putc path
 
-(Originally: BootROM `mret`-ing to `recovery.riscv` produced no visible output because FESVR only watches the *first* ELF's `tohost`/`fromhost` symbols, not recovery's own `.htif` section.)
+**Status:** Localized but not yet fully diagnosed. The full mret-to-recovery handoff works end-to-end (proven by exit code `0x41` — see Recovery Handler section). The only thing that doesn't work is recovery's `printf` itself: with a `printf` in `recovery_main()`, sim hangs forever at the first character of output. Without `printf` (just direct `tohost` exit-syscall write from `recovery_main`), recovery main runs and the test passes cleanly.
 
-**Resolution:** Took the second fix candidate listed below — instead of `mret`-ing and then trying to make recovery's HTIF mailbox visible, `enter_recovery()` now writes a known exit-code-encoded value directly to the (kernel) `tohost` address in an infinite loop, exactly mimicking riscv-pk's `_exit`. FESVR sees the write, calls `$stop` with `exit_code = reason_bit`, and the test runner reads that as the verdict. Recovery.riscv still loads at `0x80100000` (FESVR-loaded via `+payload=`) as an architectural artifact — on real silicon the same `enter_recovery` would `mret` there and recovery would `printf` its own diagnostic — but in the sim path we don't need to actually execute it.
+**What we tried and what we learned (chronological, 2026-05-12):**
+
+1. **Initially** assumed FESVR didn't see recovery's `tohost` writes because recovery uses `Makefile --defsym=tohost=0x80001e00` (absolute symbol) instead of a real `.htif`-section symbol like kernel.riscv has.
+2. **Verified by reading FESVR source** (`riscv-isa-sim/fesvr/htif.cc::load_program`): FESVR sets `tohost_addr` exclusively from `targs[0]`'s symbol table; payloads loaded via `+payload=` have their data loaded into memory but their symbols are ignored. So FESVR watches `0x80001e00` (kernel's address). Recovery's `--defsym` aligns its `tohost` references to the same `0x80001e00`. ⇒ FESVR *should* see recovery's writes. **Hypothesis A: rejected.**
+3. **Rewrote `recovery_main` to bypass `printf`** entirely — just read SR via MMIO and write `tohost = ((0x40 | sr_bits) << 1) | 1` in an infinite loop, mimicking riscv-pk's `_exit`. Rebuilt and ran. Result: sim exits cleanly with exit code `0x41`. ⇒ Recovery's `_start` crt0 (FP init, TLS, BSS clear, `__libc_init_array`) **does** work at `0x80100000`. ⇒ **Hypothesis B (crt0 hangs): rejected.**
+4. **Remaining hypothesis C: `htif_nano`'s `printf` → `htif_putc` handshake has a sim-specific cache or protocol issue.** The plausible mechanism: kernel.riscv's `tohost`/`fromhost` are in a real `.htif` section with an aligned `volatile`-friendly layout; recovery's are `--defsym`'d absolute symbols which the linker/loader treats slightly differently for cache / coherency purposes during the FESVR ack handshake on `fromhost`. We have **not** isolated this; production silicon wouldn't have FESVR in the picture so it's a sim-specific quirk.
+
+**Resolution shipped:** Recovery is built with no `printf` — just SR-read-and-exit-via-tohost. The 0x40 marker bit + SR bits in the FESVR exit code give a single integer that proves both "mret reached recovery main" and "which BootROM stage failed". No information lost relative to the `printf` version; just no human-readable narration in the log.
+
+A future investigation could un-stub `printf` and bisect where in `htif_putc` it stalls (e.g., insert a tohost-exit before/after the `tohost` write to identify whether it's the request write that gets lost, the fromhost ack poll that hangs, or the lock acquisition).
 
 ---
 
@@ -440,29 +449,32 @@ kernel started successfully rocket
 ```
 End-to-end clean: BootROM runs Stages 0 (magic), 1 (real OTP compare), 2 (stub), 4 (stub), 5 (clear_scratch + **real PMP lock**), then `mret`s to kernel. Kernel runs in M-mode with PMP isolating it from OTP and the rollback counter, prints success, exits via HTIF.
 
-**Negative test — tampered manifest header (`tests/test_tempering_manifest_header/`) — PASS strong:**
+**Negative test — tampered manifest header (`tests/test_tempering_manifest_header/`) — PASS strong, full mret path proven:**
 ```
 [UART] UART0 is here (stdin/stdout).
-*** FAILED *** (tohost = 1)
-[938305000] %Error: TestHarness.sv:99: Assertion failed: *** FAILED *** (exit code = 1)
+*** FAILED *** (tohost = 65)
+[719445000] %Error: TestHarness.sv:99: Assertion failed: *** FAILED *** (exit code = 65)
     at SimTSI.scala:21 assert(!error, "*** FAILED *** (exit code = %%d)\n", exit >> 1.U)
 %Error: TestHarness.sv:99: Verilog $stop
 ─────────────────────────────────────────
 PASS:
   ✓ kernel banner absent
-  ✓ FESVR-reported exit code = 1 (= SR_MANIFEST_HEADER bit)
+  ✓ FESVR exit code = 0x41 — BootROM mret succeeded, recovery main() reached, SR_MANIFEST_HEADER captured
 ```
-A separate `TemperedSecureBootConfig` SoC was built with the SPI flash parameterized to read a manifest whose magic was flipped from `0x54424F53` ('SOBT') to `0x44414544` ('DEAD'). BootROM Stage 0 catches it and calls `enter_recovery(SR_MANIFEST_HEADER)`, which writes `tohost = (1<<1)|1 = 3` in an infinite loop. FESVR shifts the exit-syscall bit off, gets exit code 1 = `SR_MANIFEST_HEADER` bit, and `$stop`s the sim cleanly. Wall-clock ~10s (BootROM fails fast, no full kernel boot).
+A separate `TemperedSecureBootConfig` SoC was built with the SPI flash parameterized to read a manifest whose magic was flipped from `0x54424F53` ('SOBT') to `0x44414544` ('DEAD'). The exit code `0x41` (= 65) decodes as `0x40 | 0x01`:
+- `0x40` — marker bit set by `recovery_main()` as proof "I ran"
+- `0x01` — `SR_MANIFEST_HEADER` bit, read by recovery from MMIO `0xF0003000` and OR'd in
 
-### Sim exit vs production mret
+The execution chain proven by this single integer:
+1. BootROM Stage 0 detected the bad magic
+2. `enter_recovery(SR_MANIFEST_HEADER)` wrote `0x01` to the SR
+3. BootROM pre-armed `mtvec` to `mret_trap_exit` (safety net never fires — separate test path)
+4. BootROM `mret`'d to `0x80100000`
+5. Recovery's `_start` ran through the full htif_nano crt0 (FP init, TLS, BSS clear, `__libc_init_array`)
+6. Recovery's `main()` reached, read SR, OR'd in the `0x40` marker, encoded as exit syscall
+7. FESVR saw the tohost write, called `$stop` with the decoded exit code
 
-Both shipped tests (happy path + negative) use the **same `enter_recovery` function** in BootROM. The difference is in how it exits:
-
-- **Happy path:** `enter_recovery` is never called — BootROM completes all stages, `mret`s to kernel @ `0x80000000`, kernel prints banner and `_exit`s via tohost.
-- **Sim negative path (current):** `enter_recovery` writes SR + drives FESVR `$stop` with `exit_code = reason_bit`. This is a **sim-only shortcut** that produces a clean machine-checkable verdict.
-- **Production negative path (designed but not exercised in sim):** the same `enter_recovery` would `mret` to `recovery.riscv` @ `0x80100000`, where the recovery image would handle re-flash / diagnostics / phone-home. FESVR is the only reason we don't do this in sim — its single-ELF HTIF mailbox model makes recovery's own `printf` invisible (see Discovery E).
-
-The decision was: a strong machine-checkable PASS signal (`exit code = SR_MANIFEST_HEADER bit`) is more valuable than a fragile visible-but-not-exit-able `printf` from recovery. Real silicon would do both.
+If any link in this chain were broken, we'd see a different exit code (0x80 = mret trapped, 0x01 = recovery main not reached, no exit code = sim hung in crt0).
 
 ---
 

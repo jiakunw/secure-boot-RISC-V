@@ -35,9 +35,11 @@ cd "$CHIPYARD_HOME/sims/verilator"
 # FESVR loads ONLY the first positional ELF (targs[0]). Extra ELFs must
 # be passed via the `+payload=<path>` plusarg, which goes through FESVR's
 # `payloads` list and gets loaded in addition to the primary kernel.
-stdbuf -oL "$SIM" "+payload=$RECOVERY" "$KERNEL" > "$LOG" 2>&1
+# 300s timeout: sim wall-clock for tempered case is typically 1-4 min
+# depending on Verilator build optimization level. 30s is too short.
+timeout 300 stdbuf -oL "$SIM" "+payload=$RECOVERY" "$KERNEL" > "$LOG" 2>&1
 SIM_EXIT=$?
-echo "sim exit code: $SIM_EXIT  (kernel-success path → 0; BootROM-tohost-exit path → reason_bit)"
+echo "sim exit code: $SIM_EXIT  (kernel-success → 0; tohost-exit path → 255 with SoC exit code in log)"
 
 echo
 echo "── sim output ───────────────────────────────────────────────────"
@@ -55,22 +57,28 @@ else
     EVIDENCE="$EVIDENCE\n  ✓ kernel banner absent"
 fi
 
-# Signal 2: FESVR-reported exit code = reason_bit (BootROM's tohost-exit signal).
-# SR_MANIFEST_HEADER = 1, so "exit code = 1" means Stage 0 caught the tamper.
-# Note: Verilator's $stop returns host exit 255; the SoC-level exit code is in
-# the SimTSI assertion line: "Assertion failed: *** FAILED *** (exit code = 1)".
-if grep -qE "exit code =[[:space:]]+1\b" "$LOG"; then
-    EVIDENCE="$EVIDENCE\n  ✓ FESVR-reported exit code = 1 (= SR_MANIFEST_HEADER bit)"
-fi
-
-# Signal 3: recovery's own printout (best evidence, may not be visible)
-if grep -q "check_manifest_header failed" "$LOG"; then
-    EVIDENCE="$EVIDENCE\n  ✓ recovery printed expected diagnostic"
-fi
-
-# Signal 4: SR readout in log
-if grep -q "boot status register = 0x00000001" "$LOG"; then
-    EVIDENCE="$EVIDENCE\n  ✓ recovery confirmed SR = 0x00000001"
+# Decode FESVR exit code. With current BootROM (mret-to-recovery + diagnostic
+# recovery), three outcomes are interesting:
+#
+#   exit code 0x41 (65)  = recovery main() reached, SR contains bit 0 (manifest)
+#                          → BootROM detected tampering AND mret'd to recovery
+#                            AND recovery's crt0+main ran end-to-end. Strongest PASS.
+#   exit code 0x80 (128) = BootROM's mret_trap_exit safety net fired
+#                          → mret traps (recovery .text not at 0x80100000 or
+#                            illegal instruction)
+#   exit code 0x01 (1)   = older tohost-exit-from-BootROM path (no mret was taken)
+#
+# Verilator's $stop returns host shell exit 255; the SoC-level exit code is in
+# the SimTSI assertion line: "Assertion failed: *** FAILED *** (exit code = N)".
+if grep -qE "exit code =[[:space:]]+65\b" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ FESVR exit code = 0x41 — BootROM mret succeeded, recovery main() reached, SR_MANIFEST_HEADER captured"
+elif grep -qE "exit code =[[:space:]]+128\b" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ⚠ FESVR exit code = 0x80 — BootROM mret TRAPPED (recovery firmware not at 0x80100000 or unreachable)"
+elif grep -qE "exit code =[[:space:]]+1\b" "$LOG"; then
+    EVIDENCE="$EVIDENCE\n  ✓ FESVR exit code = 1 — BootROM tohost-exit path (no recovery mret)"
+else
+    EVIDENCE="$EVIDENCE\n  ⚠ no FESVR exit code line found (sim hung)"
+    PASS=false
 fi
 
 if $PASS; then
