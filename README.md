@@ -120,6 +120,8 @@ via the plusarg path. See §9 and
   side-channel attacks from post-boot software.
 - **C4. Replay of old signed images:** the attacker may attempt to
   load legitimately signed but outdated (vulnerable) firmware.
+- **C5. Information Leakage:** the attacker can use EM analysis, power analysis
+    SPA/DPA/CPA, decapping + passive microprobe reads to read information about CPU and peripherals.
 
 ### 2.3 Trust Assumptions
 
@@ -131,11 +133,37 @@ via the plusarg path. See §9 and
   on an air-gapped workstation or HSM) and is not compromised.
 - **T4.** Cryptographic primitives (SHA-256, Ed25519) are
   computationally secure against realistic adversaries.
+- **T5.** Recovery mode is ALWAYS TRUSTED. (To make it absolutely trusted, we could have put it in a seperate ROM, but for the sake of time we did not do it).
 
 ### 2.4 Out of Scope
 
-- **O1.** Physical attacks: fault injection, EM analysis, decapping,
-  probing, power analysis.
+- **O1.** Gault-injection attacks. We separate this class
+  into two sub-tiers based on what defenses would actually require:
+  - **(a) Fault-injection attacks** (voltage / clock / EM glitching;
+    laser fault injection). Known RTL- and C-level mitigations exist
+    — TMR on critical CSRs, ECC/parity on the OTP read path,
+    dual-rail "verified" flags, hardware and software control-flow
+    integrity (CFI) counters, redundant compares, and read-back
+    verification on every critical write. We **identified these
+    mitigations but did not implement them in this project** because
+    (i) they raise attacker cost but do not reduce it to zero —
+    complete fault-injection defense additionally requires
+    mixed-signal sensors (brownout / clock-glitch / photodiode
+    detectors) which fall outside the RTL+software focus of this
+    course, and (ii) our priority for this milestone was establishing
+    the **correctness** of the chain-of-trust rather than the
+    physical-attack **depth** of any single stage. The concrete
+    mitigation list is preserved as a follow-up roadmap (see
+    [docs/PROGRESS.md](docs/PROGRESS.md) Future Work).
+  - **(b) Permanent physical-rewrite attacks** (decapping +
+    focused-ion-beam circuit edits, anti-tamper-mesh bypass). This is
+    the only sub-tier that is **genuinely outside the RTL+software
+    scope**: defending against an attacker who can rewrite metal
+    layers requires active mesh, anti-tamper packaging, PUF binding
+    of the trust root, and spatial separation of critical cells as
+    place-and-route constraints. Trust assumption **T1** (OTP and
+    BootROM are physically immutable post-manufacture) is the
+    explicit boundary for this sub-tier.
 - **O2.** Supply-chain attacks on the RTL or toolchain.
 - **O3.** DRAM-level attacks (e.g., Rowhammer) — our simulation
   environment does not model DRAM.
@@ -236,9 +264,7 @@ Five MMIO peripherals are added to the default Rocket SoC:
 - **Recovery firmware** (`software/recovery/`) — small baremetal binary
   loaded at `0x80100000` via `+payload=`. On entry it reads the status
   register, emits a UART banner naming the failed stage, and exits via
-  HTIF tohost (the sim-only signaling path; see
-  [memory/project_fesvr_recovery_pitfall.md](../../.claude/projects/-home-wangjiakun-Development-secure-boot-RISC-V/memory/project_fesvr_recovery_pitfall.md)
-  for the FESVR + recovery interaction).
+  HTIF tohost (the sim-only signaling path.
 - **Kernel** (`software/kernel/`) — minimal baremetal demo program
   executed on successful boot.
 - **Crypto** (`software/crypto/`) — SHA-256 only (Ed25519 is now in
