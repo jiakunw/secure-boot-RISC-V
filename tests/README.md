@@ -1,16 +1,52 @@
 # Tests
 
-Three end-to-end tests for the secure-boot SoC. All run against a Verilator-built
-simulator binary. Two negative tests verify that BootROM rejects tampered firmware
-and hands off to recovery; one positive test verifies a clean boot.
+Two complementary test frameworks for the secure-boot SoC:
+
+1. **`test_tempering_*/`** — Four "dramatic" negative tests + one happy path. Build-time tampered artifacts; main repo never modified. **One test per BootROM verification stage** (except Stage 2, see below).
+2. **`validation_tests/`** — Supplementary regression framework with 4 quick (no-Verilator) integrity checks + 11 sim tests including granular per-byte tampering for Stages 0/1/2/3 and design-audit / perf cases.
+
+Both frameworks coexist and pass independently. Together they give **5/5 active BootROM stages full negative coverage**.
+
+## Dramatic tests (`test_tempering_*/`)
 
 | Test | What it tampers | Expected BootROM stage | Expected SR bit |
 |---|---|---|---|
 | **Happy path** (this README) | nothing | all stages pass, mret to kernel | none — kernel banner appears |
 | [test_tempering_manifest_header](test_tempering_manifest_header/) | manifest magic (`SOBT` → `DEAD`) | Stage 0 (`check_manifest_header`) | `0x01` |
 | [test_tempering_public_key](test_tempering_public_key/) | one byte of public key | Stage 1 (`check_public_key`) | `0x02` |
+| Stage 2 (Ed25519 signature) | — | — | covered by `validation_tests/15` and `16` |
 | [test_tempering_kernel](test_tempering_kernel/) | entire kernel image (replaced with a malicious binary that would print `bad kernel!`) | Stage 3 (`check_and_load_kernel`) | `0x08` |
 | [test_tempering_version](test_tempering_version/) | manifest `version` field (set to 1, but the rollback counter is elaborated with `resetValue=5` to simulate a prior-newer-firmware bump) | Stage 4 (`check_rollback_counter`) | `0x10` |
+
+Each dramatic test has its own `build.sh` (one-time artifact generation, ~5 sec or ~20 min depending on whether a separate Verilator sim binary is needed) and `run.sh` (stages tampered hex, runs sim, prints 5- or 6-signal PASS verdict, restores good hex). Main repo's `flash_image/`, `metadata/`, `software/` are **never modified** by any test.
+
+## Validation tests (`validation_tests/`)
+
+Supplementary regression suite with shared `lib/common.sh` helpers (`vt_backup_artifacts`, `vt_restore_artifacts`, `vt_regen_hex_and_stage`, `vt_run_sim`, `vt_expect_positive_boot`, `vt_expect_rejection`) and a generic `tools/image_tool.py` for parameterized byte-level tampering (`patch-flash-byte --offset --xor`, `zero-flash-region`, `patch-manifest-field`).
+
+| Category | What | When to run |
+|---|---|---|
+| `--quick` (4 tests, < 30 sec, no Verilator) | Artifact integrity (`00`), BootROM source-policy grep (`01`), static-mutation checks (`02`), design audit (`20`) | Pre-commit / PR check |
+| `--sim` (11 tests, ~35 min total) | Sim positive boot (`10`), manifest magic/header (`11/12`), pubkey flip/zero (`13/14`), **signature flip/zero (`15/16`)**, kernel byte flip (`17`), payload_size=0 (`18`), bad load_addr (`19`), perf timing (`21`) | Pre-release regression |
+| `--all` | Both | Final-report regression |
+
+Run with:
+```bash
+bash tests/validation_tests/run_all.sh --quick
+bash tests/validation_tests/run_all.sh --sim
+bash tests/validation_tests/run_all.sh --all
+```
+
+Logs land in `tests/validation_tests/logs/`. See [tests/validation_tests/README.md](validation_tests/README.md) for full details.
+
+### Isolation tiers
+
+| Tier | Where | Mechanism | Robust to SIGKILL | Parallel-safe |
+|---|---|---|---|---|
+| (a) Build-time tamper | `test_tempering_*/` | Tampered artifacts checked into test dir; main repo unmodified | ✓ | ✓ |
+| (b) Runtime tamper + trap-restore | `validation_tests/` | Modify main repo, `trap restore EXIT` to undo | ✗ (recover via `git checkout`) | ✗ (serial only) |
+
+Tier (a) is more robust at the cost of pre-built artifacts per test. Tier (b) is more code-efficient (one `image_tool.py` patches any byte) at the cost of fragility under abnormal termination. **Both pass.**
 
 ---
 

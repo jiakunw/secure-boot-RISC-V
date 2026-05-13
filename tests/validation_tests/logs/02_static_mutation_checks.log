@@ -1,0 +1,28 @@
+== static mutation checks ==
+These do not run the CPU. They prove the artifact checker catches bad generated files.
+Each case starts from a freshly signed temp copy so stale repo artifacts do not hide the specific failure.
+
+-- manifest magic byte changed --
+patched flash_image.bin at 0x00000000: 0x53 -> 0xac
+PASS: artifact checker rejected bad case: manifest magic byte changed
+FAIL: flash manifest region matches metadata/manifest.bin
+SUMMARY: 1 artifact check(s) failed
+
+-- public key byte changed in flash --
+patched flash_image.bin at 0x000000a5: 0x70 -> 0x8f
+PASS: artifact checker rejected bad case: public key byte changed in flash
+FAIL: flash public key region matches metadata/public_key.bin
+SUMMARY: 1 artifact check(s) failed
+
+-- kernel byte changed in flash --
+patched flash_image.bin at 0x000000c0: 0x81 -> 0x7e
+PASS: artifact checker rejected bad case: kernel byte changed in flash
+FAIL: flash kernel region matches software/kernel/kernel.bin
+SUMMARY: 1 artifact check(s) failed
+
+-- manifest payload_size changed without rebuilding flash/signature --
+patched manifest.payload_size: 7896 / 0x1ed8 -> 0 / 0x0
+PASS: artifact checker rejected bad case: manifest payload_size changed without rebuilding flash/signature
+FAIL: manifest payload_size matches kernel.bin size
+FAIL: flash manifest region matches metadata/manifest.bin
+SUMMARY: 2 artifact check(s) failed

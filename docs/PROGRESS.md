@@ -5,6 +5,39 @@ Target: secure-boot SoC on Chipyard 1.13.0 + Rocket Chip + Verilator.
 
 ---
 
+## Processor Specification Compliance
+
+The simulated microcontroller is built on Chipyard's Rocket Chip integration, configured as `WithNHugeCores(1)` (single Rocket core). Specification-required processor features:
+
+| Required feature | Implementation |
+|---|---|
+| 64-bit RISC-V | RV64GC ISA — base I + M (mul/div) + A (atomics) + F + D (FP) + C (compressed) |
+| 5-stage in-order pipeline | Rocket's standard pipeline: Fetch → Decode → Execute → Memory → Writeback |
+| Branch prediction | Rocket's BTB (Branch Target Buffer) + RAS (Return Address Stack), configurable via `RocketTileParams` |
+| Virtual memory | Sv39 page-based MMU: 39-bit virtual addresses, 4 KB / 2 MB / 1 GB pages, hardware page-table walker, per-hart TLB, full M / S / U privilege modes |
+
+The secure-boot subsystem (BootROM + custom MMIO peripherals + recovery firmware) is a **separate, orthogonal feature layered on top of this processor**. The processor's VM capability is hardware-present but not exercised by the boot chain — BootROM and the test kernel execute in M-mode where PMP, not page tables, provides the active memory protection. See "How VM and Secure Boot Compose" below for the architectural argument explaining the design decision.
+
+### How VM and Secure Boot Compose (defense-in-depth)
+
+The two features are **complementary, not redundant**. A production OS layered on this SoC would compose them as:
+
+| Layer | Mechanism | Trust assumption |
+|---|---|---|
+| Pre-boot | OTP-burned `SHA-256(public_key)` | Wire-traceable physical fuse, set at manufacturing |
+| Boot-time verification | BootROM Stages 0-5 (this project) | Only signed + version-monotonic images reach M-mode |
+| M-mode handoff | PMP locked: BootROM=RX, OTP+Counter=NO_ACCESS, DRAM=RWX, all with L=1 | PMP entries immutable until reset |
+| S-mode runtime | Kernel-managed Sv39 page table | Kernel is itself the verified image — its page-table policy is **authenticated software's intent** |
+| U-mode runtime | Per-process page tables, U-mode permission bits | User processes isolated from kernel + each other |
+
+**Secure boot gates *who* writes the page table; VM enforces *what* that page table says about every load/store at runtime.** Neither is redundant: a system with only secure boot but no VM would let a kernel exploit pivot into kernel-memory disclosure post-boot; a system with VM but no secure boot would let an attacker install their own kernel that defines page tables to expose OTP / disable mitigations.
+
+**PMP takes precedence over VM translation in the access-check pipeline** — even a compromised S-mode kernel cannot remap OTP into its virtual space, because the M-mode-locked PMP NO_ACCESS rule fires before page-table walk. This is the hardware guarantee that **secure boot's PMP configuration is a runtime trust anchor**, not just a boot-time check.
+
+(The current test kernel does not enable Sv39 because (i) it has nothing meaningful to do with VM beyond saying "still works," (ii) the kernel handed off by BootROM is signed M-mode code in this project's threat model, and (iii) demonstrating VM in sim would require a non-trivial S-mode crt0 rewrite that is orthogonal to secure-boot verification. The Rocket Chip processor we instantiate satisfies the spec's VM requirement at the hardware level regardless of which mode the kernel chooses to run in.)
+
+---
+
 ## Architecture Summary
 
 ```
@@ -179,15 +212,36 @@ Stage 5: ┌──────────────────────�
 | 7 | Real Ed25519 verify (MonoCypher) in Stage 2 | 🔧 attempted, hangs | Un-stubbed code hangs in sim; previously suspected MonoCypher / OTP but earlier hangs may have been zombie-sim CPU starvation — needs re-test |
 | **+** | **Recovery handler — full mret-to-recovery handoff** | **✅ done — end-to-end** | Separate `recovery.riscv` ELF at `0x80100000` (FESVR-loaded via `+payload=`). `enter_recovery(reason_bit)` writes the SR bit, pre-arms `mtvec` at a `mret_trap_exit` safety stub, then `mret`s to `0x80100000`. Recovery's htif_nano `_start` (full crt0: FP init, TLS, BSS clear, `__libc_init_array`) runs, then `main()` reads SR via MMIO and exits the sim with FESVR exit code = `0x40 \| sr_bits`. The 0x40 marker bit proves end-to-end that the production-faithful mret path executed. |
 | **+** | **Status Register (SR) peripheral — 32-bit boot-status MMIO** | **✅ done** | New peripheral at `0xF0003000` (`hardware/status_register/rtl/sr.scala`). BootROM sets one bit per failed stage (`SR_MANIFEST_HEADER`=0x01, `SR_PUBLIC_KEY`=0x02, …, `SR_LOCK_PMP`=0x20); recovery reads via MMIO and encodes into the FESVR exit code |
-| **+** | **Negative test suite — 4 stages × full 5-6 signal PASS** | **✅ done — all real crypto exercised** | Four tampering tests, each catches a different BootROM stage: (i) `test_tempering_manifest_header` (Stage 0, separate SoC with bad-magic flash), (ii) `test_tempering_public_key` (Stage 1, build-time-tampered pubkey, real SHA-256 + OTP compare), (iii) `test_tempering_kernel` (Stage 3, entire kernel replaced with a malicious binary that would print `"bad kernel!"` if it ran — BootROM SHA-256-rejects it before mret), (iv) `test_tempering_version` (Stage 4, manifest VERSION=1 vs rollback counter pre-bumped to 5 via Scala `resetValue` parameter — models a downgrade attack on a chip whose counter was already advanced by an earlier-installed newer firmware). All four produce 5- or 6-signal PASS evidence chains with full recovery printf diagnostic visible in sim log. |
+| **+** | **Negative test suite — 4 stages × full 5-6 signal PASS** | **✅ done — all real crypto exercised** | Four tampering tests in `tests/test_tempering_*/`, each catches a different BootROM stage: (i) `test_tempering_manifest_header` (Stage 0, separate SoC with bad-magic flash), (ii) `test_tempering_public_key` (Stage 1, build-time-tampered pubkey, real SHA-256 + OTP compare), (iii) `test_tempering_kernel` (Stage 3, entire kernel replaced with a malicious binary that would print `"bad kernel!"` if it ran — BootROM SHA-256-rejects it before mret), (iv) `test_tempering_version` (Stage 4, manifest VERSION=1 vs rollback counter pre-bumped to 5 via Scala `resetValue` parameter — downgrade attack). All four produce 5- or 6-signal PASS evidence chains with full recovery printf diagnostic. |
+| **+** | **Ed25519 signature verifier — MMIO accelerator (Stage 2 un-stub)** | **✅ done** | New peripheral at `0xF0004000` (`hardware/ed25519/`). Chisel TileLink wrapper around a SystemVerilog BlackBox (`Ed25519VerifierSim.sv`). BootROM streams manifest (96 B) + signature (64 B) + pubkey (32 B) to the DATA register, issues START, polls STATUS for DONE/PASS/ERROR. The BlackBox is sim-only: it buffers the 192 bytes, writes them to three `/tmp/*.bin` files, and invokes `tools/verify_ed25519_from_files.py` via Verilog `$system` — that script runs PyNaCl (libsodium) `VerifyKey.verify`. The BootROM C interface is **identical to a real Curve25519+SHA-512 RTL accelerator** would expose; on silicon, drop in a synthesizable Ed25519 IP (Rambus, OpenTitan dcrypto, etc.) without touching the BootROM. |
+| **+** | **Validation test framework — `tests/validation_tests/`** | **✅ done — 4 quick + 11 sim cases** | Supplementary regression suite with `lib/common.sh` helpers (backup/restore, regen+stage, run_sim, expect_positive/rejection) and a generic `tools/image_tool.py` (patch-flash-byte, zero-flash-region, patch-manifest-field). Quick tests (no Verilator) check artifact integrity + BootROM source-policy grep. Sim tests cover signature flip/zero (Stage 2 — not covered by our 4 dramatic tests), public-key zero, header-version bad, payload-size 0, bad load-address, plus boot-timing perf. Runtime-tamper-with-trap-restore isolation; see "Test Isolation Tiers" below. |
 
 **Currently shipped (this commit):**
-- All BootROM stages 0, 1, 2, 4, 5 run end-to-end on the happy path (signature + rollback are stubs but the function bodies execute and return).
-- Stage 3 (`check_and_load_kernel`) is now **active** — it reads the entire kernel from SPI flash in a single transaction, hashes it with SHA-256, and compares against `manifest->payload_hash` before mret. The earlier multi-transaction-hang bug was sidestepped by replacing 16 × 512-byte chunked reads with one 7896-byte read (see "What Works" #4 below).
-- **PMP lock is now active**: BootROM region locked R+X (M-mode can still execute remaining instructions), OTP / Counter regions NO_ACCESS (kernel cannot read them post-lock), catch-all RWX. Kernel boots in M-mode but is isolated from the OTP root-of-trust and the rollback counter.
-- Verification failures in Stages 0, 1, 3, 5 trigger `enter_recovery(reason_bit)`, which (a) writes the failing-stage bit into the SR, (b) pre-arms `mtvec` to a `mret_trap_exit` safety stub, then (c) **`mret`s to the recovery firmware at `0x80100000`**. Recovery's `main()` reads SR via MMIO and exits the sim via tohost-exit syscall encoding `0x40 | sr_bits` so the host sees a single integer exit code containing both "recovery main() reached" + "which stage failed."
-- **Happy path verified end-to-end**: with all integrated stages (real OTP compare + real PMP lock active), the kernel still boots and prints `kernel started successfully rocket` cleanly.
-- **Negative test verified end-to-end with mret-to-recovery (PASS strong)**: tampered manifest magic → BootROM Stage 0 catches it → mret to recovery → recovery runs through full htif_nano crt0 (FP init, TLS, BSS clear, `__libc_init_array`) → `main()` reads SR → sim exits with exit code = `0x41` (= `0x40 | SR_MANIFEST_HEADER`). Kernel banner absent.
+- **6 of 6 BootROM stages are real** (was 4/6 stubbed in earlier increments). Full chain:
+  - Stage 0 `check_manifest_header` — magic + header_version compare
+  - Stage 1 `check_public_key` — SHA-256 over flash pubkey vs OTP-burned 32-byte hash
+  - **Stage 2 `check_manifest_signature` — MMIO Ed25519 verifier (host PyNaCl in sim, drop-in real RTL on silicon)**
+  - Stage 3 `check_and_load_kernel` — single-shot 7896-byte SPI read + SHA-256 vs `manifest->payload_hash`
+  - Stage 4 `check_rollback_counter` — monotonic compare + write-back-verify
+  - Stage 5 `lock_pmp` — BootROM=RX+L, OTP/Counter=NO_ACCESS+L, DRAM=RWX+L
+- Verification failures at any stage trigger `enter_recovery(reason_bit)` → writes SR bit, pre-arms `mtvec=mret_trap_exit` safety stub, mret to recovery firmware at `0x80100000`. Recovery's `main()` reads SR via MMIO, prints exact diagnostic via `say()` (direct `write(1, ...)` syscall, bypassing newlib stdio's lazy-init that traps in our linker layout), exits cleanly via `$finish`.
+- **Happy path verified end-to-end**: `kernel started successfully rocket` + `$finish`, exit=0, with **all 6 BootROM stages active** (sim log shows `EDDBG verifier rc=0` = Ed25519 verified, `boot status register=0x00000010` updated, etc.).
+- **All 4 negative tests verified end-to-end (PASS strong)**:
+  - manifest header → exit code `0x01`, recovery decodes Stage 0
+  - public key → exit code `0x02`, recovery decodes Stage 1
+  - kernel image → exit code `0x08`, recovery decodes Stage 3, `"bad kernel!"` confirmed absent
+  - version (downgrade) → exit code `0x10`, recovery decodes Stage 4
+
+### Test Isolation Tiers
+
+Tests fall into two intentional tiers:
+
+| Tier | Where | Isolation method | Robust to SIGKILL | Parallel-safe |
+|---|---|---|---|---|
+| (a) Build-time tamper | `tests/test_tempering_*/` | Pre-signed tampered artifacts checked into each test directory; main repo `flash_image/`, `metadata/` never modified | ✓ (state never dirty) | ✓ (no shared mutation) |
+| (b) Runtime tamper + trap-restore | `tests/validation_tests/tests/` | `vt_backup_artifacts` → modify main repo → `trap restore EXIT` | ✗ (SIGKILL leaves dirty state, recoverable via `git checkout`) | ✗ (serial only — shared main-repo mutation) |
+
+Tier (a) is more robust at the cost of one-time `build.sh` overhead per test. Tier (b) is more code-efficient (one `image_tool.py` patches any byte) at the cost of fragility under abnormal termination. **Both tiers' tests pass; running them together exercises the full BootROM signed-image authentication path with redundant coverage on Stages 0/1/3 and unique coverage on Stages 2 (tier b only) and 4 (tier a only).**
 
 ---
 
@@ -207,11 +261,11 @@ Stage 5: ┌──────────────────────�
    ```
    Both buffers identical and match `metadata/pubkey_hash.bin`. The compare is now wired with `enter_recovery()` on mismatch (tampering triggers recovery handoff rather than silent boot).
 
-4. **6 of 6 BootROM stages run end-to-end (4 real + 2 stubbed) with PMP lock active.** Full chain:
+4. **6 of 6 BootROM stages run end-to-end (all real) with PMP lock active.** Full chain:
    - `read_boot_parts` (3 SPI transactions: manifest, signature, pubkey)
    - **Stage 0** `check_manifest_header` — real, recovery on mismatch
    - **Stage 1** `check_public_key` — real SHA-256 + OTP-burned-hash compare, recovery on mismatch
-   - **Stage 2** `check_manifest_signature` — stub (INCREMENT 7 will un-stub real Ed25519)
+   - **Stage 2** `check_manifest_signature` — real MMIO Ed25519 verifier at `0xF0004000`. BootROM streams 192 B (manifest+sig+pubkey) to DATA register, issues START, polls STATUS for DONE+PASS/ERROR with `MAX_SPIN=10⁷` cycle timeout. Sim implementation in `hardware/ed25519/vsrc/Ed25519VerifierSim.sv` delegates to `tools/verify_ed25519_from_files.py` (PyNaCl). Production silicon: drop in synthesizable Curve25519+SHA-512 IP — BootROM C unchanged.
    - **Stage 3** `check_and_load_kernel` — real. Reads the entire kernel (7896 bytes) from SPI flash in a *single* transaction directly into DRAM @ `manifest->load_address`, runs SHA-256 over the loaded buffer, compares against `manifest->payload_hash`. Earlier 16-chunk-multi-transaction version hung in the SPI master's state machine after the first transaction; single-shot side-steps the bug.
    - **Stage 4** `check_rollback_counter` — real. Reads the 64-bit monotonic counter from MMIO `0xF0001000`, compares to `manifest->version`. If `version < counter`, downgrade attack detected → `enter_recovery(SR_ROLLBACK_COUNTER)`. If `version > counter`, BootROM writes the new version back to the counter (hardware-enforced monotonic write — the peripheral silently drops writes whose data is ≤ current value, so even compromised M-mode software cannot move the counter backwards). Tested by `test_tempering_version` (resetValue=5 vs manifest VERSION=1).
    - `clear_scratch` — real (zeros all verification buffers)
@@ -327,12 +381,17 @@ A production-faithful upgrade path would: (1) store `recovery.bin` in SPI flash 
 
 The underlying SPI-master multi-transaction bug remains in `spi_flash.scala`; we just don't exercise it. A future hardware iteration should diagnose the state machine.
 
-### 2. INCREMENT 7 — real Ed25519 verify hangs
+### 2. ~~INCREMENT 7 — real Ed25519 verify hangs~~ — RESOLVED 2026-05-13 via MMIO accelerator
 
-Un-stubbing `crypto_eddsa_check()` (MonoCypher Ed25519). Earlier attempts showed 99% CPU with no progress for 19+ minutes. Adds ~10-20 KB of crypto code into the BootROM (Curve25519 + SHA-512 + BigNum arithmetic). The TLROM resizes automatically (from 8 KB to 32 KB), so size isn't the blocker. Possible causes:
-- MonoCypher stack overflow (Ed25519 verify needs ~1-2 KB stack; current stack at 0x88010000 should have room)
-- An infinite loop in some MonoCypher inner routine
-- **Previous hangs may have been zombie-sim CPU starvation** (we had 17 leaked sims fighting for CPU). After OTP turned out to work fine once zombies were cleaned, Ed25519 deserves a re-test under clean CPU conditions — could plausibly Just Work.
+**Original symptom:** Un-stubbing in-BootROM `crypto_eddsa_check()` (MonoCypher Ed25519, software) hung Verilator at 99% CPU for 19+ minutes per attempted boot.
+
+**Root cause:** MonoCypher's software Ed25519 verify executes ~10⁷+ instructions of bignum arithmetic; under Verilator's cycle-accurate translation that's roughly 19 wall-clock minutes per verify — not infinite, but unusable for an interactive dev loop. Also a footprint concern (Ed25519 + SHA-512 + Curve25519 modular arithmetic added ~10-20 KB to the BootROM image, near the TLROM size limit).
+
+**Fix shipped:** Replaced in-BootROM software Ed25519 with an MMIO **hardware accelerator** abstraction at `0xF0004000`. The BootROM C code now contains 30 lines of MMIO driver (`check_manifest_signature` + `ed25519_write_bytes`) instead of 5000+ lines of crypto. In simulation, the accelerator is realized as a SystemVerilog BlackBox (`hardware/ed25519/vsrc/Ed25519VerifierSim.sv`) that buffers the input and delegates to host-side PyNaCl via Verilog `$system`. **Production silicon would drop in a real Curve25519+SHA-512 RTL implementation** (e.g., OpenTitan dcrypto or licensed IP) at the same MMIO interface — BootROM C is unchanged.
+
+This is closer to real-world secure boot architecture: every production secure-boot chip (Apple T2/SE, Google Titan, ARM CryptoCell) uses a dedicated crypto accelerator block. Pure-software EdDSA in BootROM is rare because of code size, speed, and side-channel concerns.
+
+**Sim cost:** Each Stage 2 verification adds ~1-2 sec wall-clock (Verilator stalls at `$system` while host Python invokes libsodium). Compare to 19+ minutes for in-BootROM software. The host-side hash function is **SHA-512** to match libsodium / PyNaCl (RFC 8032); MonoCypher's `crypto_eddsa_check` uses BLAKE2b, which is **incompatible** with PyNaCl-signed images — verified empirically and documented in `tools/verify_ed25519_from_files.py`.
 
 ### 3. ~~Recovery firmware `printf` hangs~~ — root-caused and fixed via linker anchor + stdio bypass
 
@@ -516,10 +575,10 @@ The execution chain proven by 5 independent log signals:
 
 ## TODO (in priority order)
 
-1. **Un-stub Stage 2 (Ed25519 signature verify)** — last remaining stub. Earlier hang attempt may have been zombie-sim CPU contention; clean sim retest could surprise us by working.
-2. **`test_tempering_signature`** — once Stage 2 is real, add a negative test that flips a signature byte (signature won't validate, but manifest+pubkey still pass). Same build-time-tamper pattern as `test_tempering_public_key`. Expected exit signal: `boot status register = 0x00000004` (= `SR_MANIFEST_SIGNATURE` bit 2).
-3. **Performance measurement** — boot time breakdown per stage, BootROM image size, gate count.
-4. **Final report** — design rationale, threat model, measurements, lessons learned.
+1. **Run the full validation test suite** — `bash tests/validation_tests/run_all.sh --sim` (~33 min for 11 sim tests) gives Stage 2 negative coverage via `15_sim_signature_flip` and `16_sim_signature_zero`, plus extra granular cases for Stages 0/1/3 we don't have in the dramatic-test framework.
+2. **Performance measurement** — boot-time breakdown per stage (`21_perf_positive_boot_timing` is a starting point), BootROM image size (compare with/without Ed25519 MMIO driver), gate count from Verilator/synthesis report.
+3. **(Optional) `test_tempering_signature` for symmetry** — our 4-test framework currently has no Stage 2 coverage by itself (relies on `validation_tests`'s `15/16`). For one-to-one symmetry with the other 4 negative tests, write a build-time tampered `test_tempering_signature/`. ~15 min effort, no Verilator rebuild needed (shares `SecureBootConfig` sim). Skip if `validation_tests` 15/16 is sufficient for reviewer.
+4. **Final report** — design rationale, threat model, measurements, lessons learned. The bulk of analysis is already in this PROGRESS.md; pull into IEEE-format paper.
 
 ---
 

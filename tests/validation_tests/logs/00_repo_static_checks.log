@@ -1,0 +1,42 @@
+== static artifact checks ==
+Secure boot image summary
+  manifest:       /home/wangjiakun/Development/secure-boot-RISC-V/metadata/manifest.bin (96 bytes)
+  signature:      /home/wangjiakun/Development/secure-boot-RISC-V/metadata/signature.bin (64 bytes)
+  public key:     /home/wangjiakun/Development/secure-boot-RISC-V/metadata/public_key.bin (32 bytes)
+  pubkey hash:    /home/wangjiakun/Development/secure-boot-RISC-V/metadata/pubkey_hash.bin (32 bytes)
+  flash image:    /home/wangjiakun/Development/secure-boot-RISC-V/flash_image/flash_image.bin (8088 bytes)
+
+  magic          : 0x54424f53
+  header_version : 1
+  flags          : 0
+  version        : 1
+  payload_size   : 7896
+  load_address   : 0x80000000
+  entry_point    : 0x80000000
+  reserved       : 0
+  pad            : 0
+  payload_hash   : 80e43015164829cc7f5431635fa68b433d002847435082b5db6714b476661378
+  next_pubkey_hash: 0000000000000000000000000000000000000000000000000000000000000000
+
+PASS: manifest size is 96 bytes
+PASS: signature size is 64 bytes
+PASS: public key size is 32 bytes
+PASS: pubkey hash size is 32 bytes
+PASS: manifest magic is SBOT / 0x54424F53
+PASS: manifest header_version is 1
+PASS: manifest image version is at least 1
+PASS: manifest payload_size matches kernel.bin size
+PASS: manifest load_address is in DRAM
+PASS: manifest entry_point is in DRAM
+PASS: manifest payload_hash matches kernel.bin
+PASS: pubkey_hash.bin matches SHA-256(public_key.bin)
+PASS: flash image is large enough to contain kernel
+PASS: flash manifest region matches metadata/manifest.bin
+PASS: flash signature region matches metadata/signature.bin
+PASS: flash public key region matches metadata/public_key.bin
+PASS: flash kernel region matches software/kernel/kernel.bin
+
+SUMMARY: all artifact checks passed
+
+== host-side Ed25519 signature check ==
+PASS: metadata manifest/signature/public_key verifies with MonoCypher helper

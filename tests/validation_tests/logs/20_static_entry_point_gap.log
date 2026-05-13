@@ -1,0 +1,6 @@
+== static design-gap check: entry point range ==
+BootROM checks load_address >= DRAM_BASE before loading kernel.
+This test checks whether bootrom.c also validates manifest->entry_point before mret.
+WARN: no explicit entry_point range check found in bootrom.c
+      This is a reportable limitation unless you add the check.
+      The code currently stores entry_point = manifest->entry_point and later mret's to it.

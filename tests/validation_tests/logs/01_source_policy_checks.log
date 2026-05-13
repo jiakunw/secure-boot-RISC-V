@@ -1,0 +1,24 @@
+== BootROM source policy checks ==
+PASS: BootROM calls manifest header check
+PASS: BootROM calls OTP public-key hash check
+PASS: BootROM calls Ed25519 signature check
+PASS: BootROM calls kernel load/hash check
+PASS: BootROM calls rollback counter check
+PASS: BootROM calls PMP lock path
+PASS: BootROM clears scratch before handoff
+PASS: BootROM issues fence.i
+PASS: BootROM uses Ed25519 MMIO verifier at 0xF0004000
+PASS: BootROM writes status register at 0xF0003000
+
+== Chisel config checks ==
+PASS: SecureBootConfig includes SPI flash
+PASS: SecureBootConfig includes OTP
+PASS: SecureBootConfig includes rollback counter
+PASS: SecureBootConfig includes Ed25519 verifier
+PASS: SecureBootConfig includes status register
+
+== hardware behavior checks ==
+PASS: rollback counter only advances upward
+PASS: OTP loads public-key hash from metadata/pubkey_hash.bin
+PASS: Ed verifier expects exactly 192 bytes
+PASS: Ed verifier calls host-side verifier script

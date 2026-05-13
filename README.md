@@ -1,68 +1,93 @@
-# Secure Boot on RV64 Microcontroller — Single-Stage Baseline
+# Secure Boot on RV64 Microcontroller
 
-**Course:** COMS 6424 Hardware Security  
-**Project Option:** 1 (Secure Boot on RISC-V)  
+**Course:** COMS 6424 Hardware Security
+**Project Option:** 1 (Secure Boot on RISC-V)
 **Platform:** Chipyard 1.13.0 + Rocket Chip + Verilator
 
 ---
 
 ## 1. Overview
 
-This document describes the **single-stage baseline** of our secure boot
-implementation. In this configuration, an immutable on-chip BootROM
-directly verifies and launches a single signed kernel image. The
-two-stage chain-of-trust extension (Stage B) and Linux boot (Stage C)
-build on this baseline without modifying its core mechanisms.
+This repository implements a complete RV64 secure-boot microcontroller
+on Chipyard. An immutable on-chip BootROM verifies a signed image in
+off-chip flash, launches it on success, and diverts to an on-chip
+recovery firmware on any failure. All six verification stages are
+real — none are stubbed.
 
-The baseline implements all five core security mechanisms required by
-the project:
+The implementation covers all required mechanisms:
 
-1. **Hardware-anchored public key** (OTP-stored hash)
-2. **Cryptographic image authentication** (Ed25519 signature)
-3. **Cryptographic image integrity** (SHA-256 payload hash)
-4. **Anti-rollback protection** (monotonic counter)
-5. **Post-boot isolation** (PMP with Lock)
+1. **Hardware-anchored public key** — SHA-256(pubkey) burned in OTP
+2. **Cryptographic image authentication** — Ed25519 over the manifest, verified by an MMIO accelerator
+3. **Cryptographic image integrity** — SHA-256 of kernel against `manifest.payload_hash`
+4. **Anti-rollback protection** — hardware-monotonic counter (only advances upward)
+5. **Post-boot isolation** — PMP entries with Lock bit covering BootROM, OTP, and counter
+6. **Fail-closed recovery path** — on any failure, BootROM `mret`s to a recovery firmware that publishes the failed-stage code over UART and to a status register
 
-### 1.1 Establish Connection with chipyard
+Two test frameworks exercise the system end-to-end. See
+[tests/README.md](tests/README.md) for the test matrix and
+[docs/PROGRESS.md](docs/PROGRESS.md) for the per-increment status log.
 
-Assume you have successfully setup chipyard and have enabled its virtual environment.
+### 1.1 Environment setup (every new terminal)
 
-Create `.env` in the main directory, then  setup `CHIPYARD_HOME`:
-```
-$CHIPYARD_HOME = /path/to/yout/chipyard_repo
-```
-
-go to `script`
-
-run
-```
-./integrate_to_chipyard.sh
+```bash
+cd /path/to/secure-boot-RISC-V
+export CONDA_BACKUP_RISCV=${CONDA_BACKUP_RISCV:-}
+source .env && source $CHIPYARD_HOME/env.sh
 ```
 
-This will integrates your secure-boot project into Chipyard by symlinking the Chisel sources, building the BootROM image and copying it into Chipyard's resource directory, copying the kernel sources into Chipyard's tests folder, patching its CMakeLists.txt to add a kernel target, compiling the kernel, and copying both the ELF and raw binary back to your repo.
+`.env` must define `CHIPYARD_HOME` (path to your Chipyard checkout) and
+`SECURE_BOOT_REPO` (path to this repo). The `source` chain puts
+`riscv64-unknown-elf-gcc`, Verilator, and `python3` (with `pynacl`) on
+`$PATH`.
 
-If you run into permission issue, run this
-```
-chmod +x scripts/integrate_to_chipyard.sh
+### 1.2 Integrate into Chipyard
+
+```bash
+bash scripts/integrate_to_chipyard.sh
 ```
 
-### 1.2 Start the CPU
+This script symlinks the Chisel sources into Chipyard, builds
+`bootrom.img` and stages it to all three Chipyard cache locations
+(`src/main/resources/`, `src/target/scala-2.13/classes/`, and the
+generated-src cache) with `md5` verification, patches `DigitalTop.scala`
+to include the secure-boot peripheral mixins, builds the kernel and
+recovery firmware, and invalidates Chipyard's stale `chipyard.jar`
+and sim binaries.
 
-Run the following command to build the simulator:
-```
+If you hit a permission error: `chmod +x scripts/integrate_to_chipyard.sh`.
+
+### 1.3 Build the simulator
+
+```bash
 cd $CHIPYARD_HOME/sims/verilator
-make CONFIG=SecureBootConfig
-```
-Note that when it's your first time running it, it'll take 20-30min
-
-Ryn this command to run the kernel
-
-```
-./simulator-chipyard.harness-SecureBootConfig \
-    ~/Development/secure-boot-RISC-V/software/kernel/kernel.riscv
+make -j$(nproc) CONFIG=SecureBootConfig
 ```
 
-FESVR will read `kernel.riscv` and add this to it's fake DRAM. This contains kernel code. Before using SPI Flash, we need to load `flash_image` into this fake DRAM as well. So whoever is working on the bootloader will be responsible for this.
+First build takes ~20-30 min. The output binary lives at
+`$CHIPYARD_HOME/sims/verilator/simulator-chipyard.harness-SecureBootConfig`.
+
+A second config, `TemperedSecureBootConfig`, is used only by
+[tests/test_tempering_manifest_header](tests/test_tempering_manifest_header)
+to bake a tampered flash hex into BootROM-visible memory at elaboration
+time. Build it the same way with `CONFIG=TemperedSecureBootConfig` when
+running that test.
+
+### 1.4 Run the happy path
+
+```bash
+$CHIPYARD_HOME/sims/verilator/simulator-chipyard.harness-SecureBootConfig \
+    "+payload=$SECURE_BOOT_REPO/software/recovery/recovery.riscv" \
+    "$SECURE_BOOT_REPO/software/kernel/kernel.riscv"
+echo "exit=$?"
+```
+
+Expected: `kernel started successfully rocket`, `Verilog $finish`,
+`exit=0`. Wall clock 60–180 s.
+
+The `+payload=` plusarg is **required** — FESVR's `load_program` only
+scans `targs[0]` for symbols (kernel), so the recovery image must come
+via the plusarg path. See §9 and
+[tests/README.md](tests/README.md) for details.
 
 ---
 
@@ -135,7 +160,7 @@ FESVR will read `kernel.riscv` and add this to it's fake DRAM. This contains ker
 | 5 | C2: post-boot code reads OTP / BootROM contents | A3, A5 | PMP entries lock OTP, BootROM, and counter regions; Lock bit (`L=1`) makes them inaccessible to all modes including M-mode (Stage 5) |
 | 6 | C2: post-boot code modifies counter to allow downgrade | A4 | PMP locks counter MMIO; only BootROM (before lock) can write |
 | 7 | C2: post-boot code modifies PMP to bypass restrictions | A3, A4 | PMP `L=1` makes the entry itself immutable until next reset; no software can clear lock |
-| 8 | C3: cache side channel on BootROM execution | A5 | Constant-time crypto (MonoCypher Ed25519); BootROM contains no secret-dependent memory accesses; scratch buffers cleared before boot exit |
+| 8 | C3: cache side channel on BootROM execution | A5 | Hardware Ed25519 verifier (constant-time by construction); BootROM contains no secret-dependent memory accesses; scratch buffers cleared before boot exit |
 | 9 | C3: BTB poisoning (Spectre-v2) targeting BootROM | A5 | (i) Hardware reset clears Rocket's BTB via `RegInit`; (ii) BootROM has no secret-dependent indirect branches; (iii) BootROM executes in temporal isolation (no concurrent attacker code); (iv) `fence.i` before kernel jump serializes pipeline |
 | 10 | C3: BHT side channel (BranchScope) on verification logic | A5 | Constant-time `memcmp`; constant-time crypto; no secret-dependent conditional branches in verification path |
 | 11 | C3: TLB side channel during BootROM | A5 | Not applicable: BootROM runs in M-mode without paging; TLB is unused during boot |
@@ -150,48 +175,78 @@ FESVR will read `kernel.riscv` and add this to it's fake DRAM. This contains ker
 
 - 64-bit **RV64GC** in-order scalar pipeline (Rocket Chip)
 - Branch predictor: BHT + BTB + Return Address Stack
-- **Sv39** virtual memory with TLB (available but **not used by BootROM**)
+- **Sv39** virtual memory with TLB (available; not enabled by BootROM —
+  satisfies the processor-spec VM requirement orthogonally to secure
+  boot, see [docs/PROGRESS.md](docs/PROGRESS.md) §"Processor
+  Specification Compliance")
 - M / S / U privilege modes
 - **16-entry Physical Memory Protection (PMP)** unit with Lock bit
 
 ### 3.2 Memory Map
 
-| Region            | Address Range            | Size   | Notes |
-|-------------------|--------------------------|--------|-------|
-| BootROM           | `0x10000` – `0x1FFFF`    | 64 KB  | On-chip ROM, contains verification code |
-| OTP               | `0xF0000000` – `0xF000001F` | 32 B  | MMIO peripheral, holds SHA-256(pubkey) |
-| Rollback Counter  | `0xF0001000` – `0xF0001007` | 8 B   | MMIO peripheral, hardware-monotonic |
-| DRAM (kernel)     | `0x80000000` – ...       | (configurable) | Verified kernel runs here |
-| Image staging     | `0x88000000` – ...       | (configurable) | FESVR loads signed image here in simulation |
+| Region              | Address Range                | Size   | Notes |
+|---------------------|------------------------------|--------|-------|
+| BootROM             | `0x00010000` – `0x0001FFFF`  | 64 KB  | On-chip ROM, verification code |
+| Boot scratch buffer | `0x88000000` – ...           | ~8 KB  | DRAM region BootROM uses for manifest/sig/pubkey staging |
+| OTP                 | `0xF0000000` – `0xF000001F`  | 32 B   | MMIO, SHA-256(pubkey) |
+| Rollback Counter    | `0xF0001000` – `0xF0001007`  | 8 B    | MMIO, hardware-monotonic |
+| SPI Flash Master    | `0xF0002000` – ...           | (regs) | MMIO, one-shot DMA-style read into DRAM |
+| Status Register     | `0xF0003000` – `0xF0003003`  | 4 B    | MMIO, BootROM writes failed-stage code |
+| Ed25519 Verifier    | `0xF0004000` – ...           | (regs) | MMIO accelerator: CMD / STATUS / COUNT / DATA |
+| Kernel load region  | `0x80000000` – ...           | per manifest | Verified kernel runs here |
+| Recovery firmware   | `0x80100000` – ...           | (small) | FESVR loads via `+payload=`; BootROM `mret`s here on failure |
 
 ### 3.3 New Hardware Components
 
-We add two MMIO peripherals to the default Rocket SoC:
+Five MMIO peripherals are added to the default Rocket SoC:
 
-- **OTP Peripheral.** A read-only memory containing the SHA-256 hash
-  of the developer's public key. Modeled in Chisel based on Chipyard's
-  `GCD.scala` template. In simulation, the contents are hard-coded at
-  generation time; in a real silicon flow this would be one-time
-  programmable fuses.
+- **OTP** (`hardware/otp/`) — read-only memory containing
+  SHA-256(public_key). In simulation the contents are loaded at
+  elaboration time from `metadata/pubkey_hash.bin`; in real silicon
+  these would be one-time-programmable fuses.
 
-- **Rollback Counter Peripheral.** A monotonically increasing 64-bit
-  counter accessible via MMIO. Reads return the current value; writes
-  with a value greater than the current value advance the counter;
-  writes with a value less than or equal are ignored. The counter
-  cannot be decreased, even by M-mode software.
+- **Rollback Counter** (`hardware/rollback_counter/`) — 64-bit
+  hardware-monotonic counter. Writes only take effect if the written
+  value strictly exceeds the current value. Includes a `resetValue`
+  parameter for testing downgrade scenarios.
+
+- **SPI Flash Master** (`hardware/spi_flash/`) — one-shot bulk read
+  controller. BootROM programs source/destination/length and polls a
+  status bit; the controller streams flash bytes into DRAM in a single
+  transaction.
+
+- **Status Register** (`hardware/status_register/`) — 32-bit register
+  visible to both BootROM and recovery firmware. BootROM writes
+  `SR_MANIFEST_HEADER` / `SR_PUBLIC_KEY` / `SR_MANIFEST_SIGNATURE` /
+  `SR_LOAD_KERNEL` / `SR_ROLLBACK` (codes 0x01–0x10) before diverting
+  to recovery; recovery reads it to identify which stage failed.
+
+- **Ed25519 Verifier** (`hardware/ed25519/`) — MMIO command/status
+  interface that buffers the manifest, signature, and public key (192
+  bytes total) and asserts `DONE` + `PASS` or `ERROR`. In our Verilator
+  flow, the SystemVerilog BlackBox shells out via `$system()` to
+  `tools/verify_ed25519_from_files.py` (PyNaCl / libsodium SHA-512
+  RFC 8032).
 
 ### 3.4 Software Components
 
-- **BootROM** (`software/bootrom/`): contains startup assembly and C
-  verification logic. Compiled to `bootrom.img` and embedded into the
-  Rocket SoC at elaboration time.
-- **Kernel** (`software/kernel/`): a minimal baremetal demonstration
-  program executed after successful verification.
-- **Crypto** (`software/crypto/`): SHA-256 (RFC 6234 reference) and
-  Ed25519 (MonoCypher subset).
-- **Signing tool** (`software/signing_tool/`): Python utility that
-  generates Ed25519 keypairs, computes SHA-256 hashes, builds signed
-  manifests, and assembles the final flash image.
+- **BootROM** (`software/bootrom/`) — startup assembly + C verification
+  logic. Compiled to `bootrom.img` and embedded into the Rocket SoC at
+  elaboration time.
+- **Recovery firmware** (`software/recovery/`) — small baremetal binary
+  loaded at `0x80100000` via `+payload=`. On entry it reads the status
+  register, emits a UART banner naming the failed stage, and exits via
+  HTIF tohost (the sim-only signaling path; see
+  [memory/project_fesvr_recovery_pitfall.md](../../.claude/projects/-home-wangjiakun-Development-secure-boot-RISC-V/memory/project_fesvr_recovery_pitfall.md)
+  for the FESVR + recovery interaction).
+- **Kernel** (`software/kernel/`) — minimal baremetal demo program
+  executed on successful boot.
+- **Crypto** (`software/crypto/`) — SHA-256 only (Ed25519 is now in
+  hardware; the legacy MonoCypher source remains in-tree but is no
+  longer linked into BootROM).
+- **Host tools** (`tools/`) — `manifest_generators.py`,
+  `sign_firmware.py` (PyNaCl), `flash_image_to_hex.py`,
+  `verify_ed25519_from_files.py` (called by the Ed25519 BlackBox).
 
 ---
 
@@ -215,9 +270,10 @@ typedef struct __attribute__((packed)) {
 } manifest_t;
 ```
 
-The **next_pubkey_hash** field is reserved and zeroed in the
-single-stage baseline. It enables forward extension to a two-stage
-chain (Stage B) without changing the manifest layout.
+The **next_pubkey_hash** field is reserved and zeroed in the current
+implementation. It exists as a layout-stable extension point for a
+future two-stage chain-of-trust (Stage B) without breaking the
+manifest format.
 
 ---
 
@@ -241,14 +297,15 @@ manifest.
 
 ## 6. Boot Flow (Six Stages)
 
-### Stage 0 — BootROM Initialization
+### Stage 0 — BootROM Initialization + Manifest Header Check
 
 - Hardware reset places the hart in M-mode with interrupts disabled.
 - PC is set to the reset vector (`0x10000`, the BootROM entry).
-- Startup assembly sets the stack pointer, clears BSS, and calls
-  `bootrom_main()`.
-- `bootrom_main()` validates the magic field of the manifest and
-  halts if the field is unexpected.
+- Startup assembly sets the stack pointer, clears BSS, points `mtvec`
+  at the recovery entry as a safety net, and calls `bootrom_main()`.
+- BootROM reads the manifest header from flash via SPI and validates
+  the magic field (`SBOT` = `0x54424F53`).
+- On mismatch: divert to recovery with `SR_MANIFEST_HEADER` (`0x01`).
 
 ### Stage 1 — Public Key Authentication
 
@@ -256,33 +313,39 @@ manifest.
 - Computes SHA-256 of the public key.
 - Compares the result against the OTP-stored hash using
   constant-time comparison.
-- On mismatch: **halt** (fail-closed).
+- On mismatch: divert to recovery with `SR_PUBLIC_KEY` (`0x02`).
 
 ### Stage 2 — Manifest Signature Verification
 
-- BootROM reads the 96-byte manifest and 64-byte signature.
-- Calls `crypto_eddsa_check(signature, pubkey, manifest, 96)` from
-  MonoCypher.
-- On verification failure: **halt**.
-- On success: the manifest contents are now trusted.
+- BootROM writes the 96-byte manifest, 64-byte signature, and 32-byte
+  public key into the Ed25519 verifier's `DATA` register (four bytes
+  per write), issues `CMD_START`, and polls `STATUS`.
+- On `ERROR` or polling timeout: divert to recovery with
+  `SR_MANIFEST_SIGNATURE` (`0x04`).
+- On `DONE + PASS`: the manifest contents are now trusted.
 
-### Stage 3 — Payload Hash Verification
+### Stage 3 — Kernel Load + Payload Hash Verification
 
-- BootROM streams the kernel binary in fixed-size chunks (e.g., 512 B)
-  and incrementally updates a SHA-256 context.
-- After all bytes are processed, the resulting digest is compared
-  against `manifest.payload_hash` using constant-time comparison.
-- On mismatch: **halt**.
-- This step protects against in-flight modifications to the kernel
-  bytes that would not affect the (separately signed) manifest.
+- BootROM programs the SPI flash master with source offset, DRAM
+  destination, and length (read from `manifest.payload_size`) and
+  issues a single bulk-read transaction.
+- After the transaction completes, BootROM hashes the loaded region
+  in DRAM with SHA-256 and compares against `manifest.payload_hash`
+  via constant-time `memcmp`.
+- On mismatch: divert to recovery with `SR_LOAD_KERNEL` (`0x08`).
+- This step protects against in-flight modifications to kernel bytes
+  that would not affect the (separately signed) manifest.
 
 ### Stage 4 — Anti-Rollback Check and Counter Update
 
 - BootROM reads the current value of the rollback counter via MMIO.
 - Compares with `manifest.version`:
-  - `version < counter` → **halt** (downgrade attack).
+  - `version < counter` → divert to recovery with `SR_ROLLBACK` (`0x10`).
   - `version == counter` → continue.
-  - `version > counter` → write `version` to counter (advancing it).
+  - `version > counter` → write `version` to the counter and
+    **read it back** to confirm the advance took effect (the counter
+    only accepts strict-increase writes; readback proves the hardware
+    monotone property held).
 - The counter update happens **only after all prior verifications
   pass**, preventing a malicious manifest from advancing the counter
   to lock out future legitimate updates.
@@ -290,26 +353,31 @@ manifest.
 ### Stage 5 — Boot-Exit Hardening and Jump
 
 - Clear scratch buffers used during verification (SHA-256 state,
-  Ed25519 working set) using `memset`.
-- Configure PMP entries with Lock bit:
-  - Entry 0: BootROM region — no R/W/X, locked.
-  - Entry 1: OTP region — no R/W/X, locked.
-  - Entry 2: Rollback counter region — no R/W/X, locked.
-  - Entry 3: Catch-all — R/W/X, locked (allows kernel access to DRAM
-    and other peripherals).
-- Issue `fence` to drain pending stores (PMP configuration committed,
-  scratch zeros visible).
-- Issue `fence.i` to serialize the pipeline and synchronize the
-  instruction cache.
-- Set `mepc` to `manifest.entry_point` and execute `mret` to jump
-  into the verified kernel.
+  Ed25519 staging) using `memset`.
+- Configure PMP entries with Lock bit (NAPOT mode, `L=1`):
+  - Entry 0: BootROM region — no R/W/X.
+  - Entry 1: OTP region — no R/W/X.
+  - Entry 2: Rollback counter region — no R/W/X.
+  - Entry 3: Catch-all — R/W/X (kernel access to DRAM and remaining
+    peripherals).
+- `mtvec` is also pointed at the recovery entry as a final safety net
+  so that any trap during/after handoff lands in recovery rather than
+  ROM dead-loop.
+- Issue `fence` to drain pending stores (PMP committed, scratch zeros
+  visible), then `fence.i` to serialize the pipeline.
+- Set `mepc` to `manifest.entry_point`, prime `mstatus.MPP=11` for an
+  M-mode return, and execute `mret` to enter the verified kernel.
 
 ### Failure Mode
 
-All verification failures result in an unconditional halt loop
-(`wfi; j .`). No recovery, no retry, no partial boot. This
-**fail-closed** posture is consistent with industrial secure boot
-practice (ARM TBB, OpenTitan).
+Any verification failure writes a stage-identifying code to the status
+register and `mret`s into the recovery firmware at `0x80100000`. The
+recovery firmware reads the status register, emits a UART banner
+(`recovery: stage X failed`), and exits via HTIF tohost. No retry, no
+partial boot — **fail-closed**, consistent with ARM TBB and OpenTitan
+practice. The diversion path is itself protected: BootROM sets `mtvec`
+to the recovery entry before any verification work begins, so even an
+unexpected fault routes into recovery rather than dead-looping in ROM.
 
 ---
 
@@ -358,6 +426,12 @@ families of transient execution attacks:
   Rocket's cache hierarchy.
 - **LVI** requires speculative forwarding of injected values, not
   possible in-order.
+
+Additionally, Ed25519 signature verification is offloaded to a
+**hardware accelerator** (see §3.3), so the BootROM CPU executes no
+secret-dependent crypto code at all. SHA-256 (used for the kernel
+payload hash and for OTP comparison) is a public-input computation
+with no secret-dependent control flow.
 
 ### 8.2 Residual Risks and Mitigations
 
@@ -418,47 +492,70 @@ recovery.
 
 - Linux (Ubuntu 20.04+ recommended)
 - Chipyard 1.13.0 installed
-- Conda environment activated
+- Conda environment with `riscv64-unknown-elf-gcc`, Verilator, Python 3
+- `pip install pynacl` (used by `sign_firmware.py` and the Ed25519
+  BlackBox host-side verifier)
 
 ### 9.2 First-Time Setup
 
 ```bash
 git clone <this-repo>
 cd secure-boot-RISC-V
-cp .env.example .env
-# Edit .env to set CHIPYARD_HOME=/path/to/chipyard
+# Create .env with CHIPYARD_HOME and SECURE_BOOT_REPO:
+cat > .env <<EOF
+export CHIPYARD_HOME=/path/to/chipyard
+export SECURE_BOOT_REPO=$(pwd)
+EOF
+source .env && source $CHIPYARD_HOME/env.sh
 ```
 
 ### 9.3 Build and Run a Verified Kernel
 
 ```bash
-# 1. Generate a signed image
-cd software/signing_tool
-python sign_firmware.py --kernel ../kernel/kernel.bin \
-                        --output flash_image.bin
+# 1. Regenerate signed flash image from current keypair + kernel.bin
+bash tests/validation_tests/regenerate_artifacts.sh
+# (rebuilds metadata/manifest.bin, metadata/signature.bin,
+#  flash_image/flash_image.bin, flash_image/flash_image.hex,
+#  and stages the .hex into Chipyard's sim working directory)
 
-# 2. Integrate into Chipyard and build
-cd ../..
-./scripts/integrate_to_chipyard.sh
-
+# 2. Integrate into Chipyard and build the simulator
+bash scripts/integrate_to_chipyard.sh
 cd $CHIPYARD_HOME/sims/verilator
-make CONFIG=SecureBootConfig
+make -j$(nproc) CONFIG=SecureBootConfig
 
-# 3. Run simulation
+# 3. Run simulation (note: +payload= is required, see §1.4)
 ./simulator-chipyard.harness-SecureBootConfig \
-    ~/secure-boot-RISC-V/software/signing_tool/flash_image.bin
+    "+payload=$SECURE_BOOT_REPO/software/recovery/recovery.riscv" \
+    "$SECURE_BOOT_REPO/software/kernel/kernel.riscv"
 ```
 
 ### 9.4 Negative Tests
 
+Two complementary frameworks. See [tests/README.md](tests/README.md)
+for full details.
+
+**Dramatic build-time-tamper tests** (`tests/test_tempering_*/`) — one
+per BootROM verification stage (Stage 2 deferred to the validation
+suite). Each has its own `build.sh` + `run.sh`:
+
 ```bash
-cd tests
-./test_tampered_kernel.sh    # expect: BootROM halts at Stage 3
-./test_wrong_pubkey.sh       # expect: BootROM halts at Stage 1
-./test_bad_signature.sh      # expect: BootROM halts at Stage 2
-./test_rollback_attempt.sh   # expect: BootROM halts at Stage 4
-./test_pmp_enforcement.sh    # expect: kernel fault on OTP access
+bash tests/test_tempering_manifest_header/run.sh   # Stage 0 → SR=0x01
+bash tests/test_tempering_public_key/run.sh        # Stage 1 → SR=0x02
+bash tests/test_tempering_kernel/run.sh            # Stage 3 → SR=0x08
+bash tests/test_tempering_version/run.sh           # Stage 4 → SR=0x10
 ```
+
+**Validation regression suite** (`tests/validation_tests/`) — shared
+helpers + 15 tests with parameterized byte-level tampering:
+
+```bash
+bash tests/validation_tests/run_all.sh --quick   # 4 tests, <30 s, no Verilator
+bash tests/validation_tests/run_all.sh --sim     # 11 sim tests, ~35 min
+bash tests/validation_tests/run_all.sh --all
+```
+
+The two frameworks pass independently. Together they give **5/5 active
+BootROM stages full negative coverage**.
 
 ---
 
@@ -466,43 +563,55 @@ cd tests
 
 ```
 secure-boot-RISC-V/
-├── README.md                         (this file)
-├── .env.example
-├── docs                              (saves docs)
-├── flash_image
-|   └── flash_image.bin
+├── README.md                              (this file)
+├── .env                                   (CHIPYARD_HOME, SECURE_BOOT_REPO)
+├── docs/
+│   └── PROGRESS.md                        (per-increment status log)
+├── flash_image/
+│   ├── flash_image.bin                    (manifest + sig + pubkey + kernel)
+│   └── flash_image.hex                    (staged into Chipyard sim)
 ├── metadata/
-|   ├── manifest.bin
-|   ├── private_key.bin
-|   ├── pubkey_hash.bin
-|   └── public_key.bin
-├── hardware/
-|   ├── otp/
-|   ├── rollback_counter/
-|   └── spi_flash/
+│   ├── manifest.bin
+│   ├── signature.bin
+│   ├── private_key.bin                    (dev key, gitignored in production)
+│   ├── public_key.bin
+│   └── pubkey_hash.bin                    (loaded into OTP at elaboration)
+├── hardware/                              (all in Chisel/SystemVerilog)
+│   ├── secureboot/SecureBootConfig.scala  (top-level Config chain)
+│   ├── otp/                               (read-only pubkey hash MMIO)
+│   ├── rollback_counter/                  (monotonic counter MMIO, resetValue param)
+│   ├── spi_flash/                         (bulk-read DMA MMIO)
+│   ├── status_register/                   (failed-stage SR MMIO)
+│   └── ed25519/                           (BlackBox verifier + Scala wrapper)
 ├── software/
 │   ├── bootrom/
-│   │   ├── bootrom.S                 (startup assembly)
-│   │   ├── bootrom.c                 (verification logic, to be added)
-│   │   ├── linker.ld                 (BootROM linker script)
-│   │   └── Makefile                  (build bootrom.img)
-│   ├── crypto/
-│   │   ├── include/
-|   |   |   ├── monocypher.h
-|   |   |   └── sha256.h
-|   |   ├── src/
-│   |   |   ├── monocypher.c
-|   |   |   └── sha256.c
+│   │   ├── bootrom.S                      (startup assembly, sets sp, calls C)
+│   │   ├── bootrom.c                      (all 6 verification stages)
+│   │   ├── linker.ld
+│   │   └── Makefile                       (produces bootrom.img embedded into SoC)
+│   ├── recovery/
+│   │   ├── recovery.c                     (failed-stage UART banner + HTIF exit)
+│   │   ├── recovery.ld                    (anchors .htif at 0x80001e00)
+│   │   └── Makefile
 │   ├── kernel/
-│   │   ├── kernel.c                  (demo kernel)
-│   │   ├── kernel.bin 
-|   |   ├── kernel.riscv
-|   |   ├── manifest.h                (manifest)
-│   │   └── Makefile                  
+│   │   ├── kernel.c                       (demo kernel, prints banner)
+│   │   ├── kernel.bin
+│   │   ├── kernel.riscv
+│   │   └── Makefile
+│   └── crypto/                            (SHA-256 only used at runtime)
 ├── tools/
-│   ├── key_generator.py              (generate a key pair in binary)
-│   ├── manifest_generator.py         (generate the manifest in binary)
-│   └── sign_firmware.py              (generate the manifest signature in binary)
+│   ├── key_generator.py
+│   ├── manifest_generators.py
+│   ├── sign_firmware.py                   (PyNaCl Ed25519)
+│   ├── flash_image_to_hex.py
+│   └── verify_ed25519_from_files.py       (called by Ed25519 BlackBox in sim)
+├── tests/
+│   ├── README.md                          (test framework overview)
+│   ├── test_tempering_manifest_header/    (Stage 0 negative test)
+│   ├── test_tempering_public_key/         (Stage 1)
+│   ├── test_tempering_kernel/             (Stage 3, with bad_kernel.c payload)
+│   ├── test_tempering_version/            (Stage 4, with TamperedRollbackSecureBootConfig)
+│   └── validation_tests/                  (regression suite, --quick / --sim / --all)
 └── scripts/
-    └── integrate_to_chipyard.sh
+    └── integrate_to_chipyard.sh           (idempotent integration with md5 verification)
 ```
