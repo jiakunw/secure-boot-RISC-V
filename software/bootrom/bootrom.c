@@ -4,6 +4,23 @@
 #include "sha256.h"
 #include "monocypher.h"
 
+/* Ed25519 MMIO verifier (sim BlackBox at hardware/ed25519/, delegates to
+ * host MonoCypher via $system). BootROM streams manifest+sig+pubkey to
+ * the DATA register, issues START, polls STATUS for DONE+PASS/ERROR. */
+#define ED25519_VERIFY_BASE 0xF0004000UL
+#define ED25519_CMD         (ED25519_VERIFY_BASE + 0x00)
+#define ED25519_STATUS      (ED25519_VERIFY_BASE + 0x04)
+#define ED25519_COUNT       (ED25519_VERIFY_BASE + 0x08)
+#define ED25519_DATA        (ED25519_VERIFY_BASE + 0x0c)
+
+#define ED25519_CMD_CLEAR   0x1u
+#define ED25519_CMD_START   0x2u
+
+#define ED25519_BUSY        (1u << 0)
+#define ED25519_DONE        (1u << 1)
+#define ED25519_PASS        (1u << 2)
+#define ED25519_ERROR       (1u << 3)
+
 #define SPI_BASE      0xF0002000UL
 #define SPI_ADDR      (SPI_BASE + 0x00)
 #define SPI_LEN       (SPI_BASE + 0x04)
@@ -66,6 +83,12 @@
 #define KERNEL_CHUNK       ((uint8_t *)(BOOT_SCRATCH_BASE + 0x0400u))
 
 #define KERNEL_CHUNK_SIZE 512u
+
+/* Bounded-spin guard for any hardware poll loop. SPI's DATA_READY/DONE and
+ * Ed25519's DONE/PASS bits are normally set within thousands of cycles;
+ * if we ever spin past MAX_SPIN, the peripheral is jammed and we should
+ * fail safely into recovery rather than hang the sim forever. */
+#define MAX_SPIN 10000000u
 
 #define PMP_LOCK_NAPOT_NO_ACCESS 0x98u   /* L=1, NAPOT, ---  */
 #define PMP_LOCK_NAPOT_RX        0x9Du   /* L=1, NAPOT, R-X  (M-mode can execute) */
@@ -252,17 +275,23 @@ static void start_flash_read(uint32_t flash_offset, uint32_t total_bytes)
 static void read_flash_words(uint8_t *output_buffer, uint32_t total_bytes)
 {
     uint32_t bytes_read = 0;
+    uint32_t spin = 0;
 
     while (bytes_read < total_bytes) {
         uint32_t status = read_register(SPI_STATUS);
 
         if ((status & SPI_ERROR) != 0) {
-            halt();
+            enter_recovery(SR_LOAD_KERNEL);
         }
 
         if ((status & SPI_DATA_READY) == 0) {
+            if (++spin > MAX_SPIN) {
+                enter_recovery(SR_LOAD_KERNEL);
+            }
             continue;
         }
+
+        spin = 0;
 
         uint32_t word = read_register(SPI_DATA);
 
@@ -272,7 +301,11 @@ static void read_flash_words(uint8_t *output_buffer, uint32_t total_bytes)
         }
     }
 
+    spin = 0;
     while ((read_register(SPI_STATUS) & SPI_DONE) == 0) {
+        if (++spin > MAX_SPIN) {
+            enter_recovery(SR_LOAD_KERNEL);
+        }
     }
 }
 
@@ -330,15 +363,64 @@ static void check_public_key(void)
     }
 }
 
-/* INCREMENT 4 known-good baseline: signature check stubbed.
- * MonoCypher's crypto_eddsa_check (INCREMENT 7) also hangs in sim;
- * keeping stubbed in this revision. */
+/* Stage 2: verify the manifest signature against the trusted public key.
+ *
+ * In-software Ed25519 verify (MonoCypher's crypto_eddsa_check) hangs in
+ * the BootROM-context Verilator sim for 19+ minutes — likely an inner
+ * loop combined with no compiler optimization on the verification path.
+ * Instead, we expose Ed25519 verify as an MMIO hardware accelerator at
+ * 0xF0004000 (hardware/ed25519/, sim BlackBox delegates to host
+ * MonoCypher via $system). The BootROM interface is identical to a real
+ * Curve25519+SHA-512 RTL accelerator — a future ASIC drop-in.
+ *
+ * Protocol:
+ *   1. CMD <- ED25519_CMD_CLEAR  (reset peripheral buffer + status)
+ *   2. Stream 96B manifest + 64B signature + 32B pubkey to DATA register
+ *   3. CMD <- ED25519_CMD_START
+ *   4. Poll STATUS until DONE; check PASS / ERROR bits
+ */
+static void ed25519_write_bytes(const uint8_t *data, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i += 4) {
+        uint32_t word =
+            ((uint32_t)data[i + 0] <<  0) |
+            ((uint32_t)data[i + 1] <<  8) |
+            ((uint32_t)data[i + 2] << 16) |
+            ((uint32_t)data[i + 3] << 24);
+        write_register(ED25519_DATA, word);
+    }
+}
+
 static void check_manifest_signature(void)
 {
-    /* TODO restore (INCREMENT 7):
-     * if (crypto_eddsa_check(SIGNATURE_BUFFER, PUBLIC_KEY_BUFFER,
-     *                        MANIFEST_BUFFER, MANIFEST_SIZE) != 0) halt();
-     */
+    uint32_t spin = 0;
+
+    write_register(ED25519_CMD, ED25519_CMD_CLEAR);
+
+    ed25519_write_bytes(MANIFEST_BUFFER, MANIFEST_SIZE);
+    ed25519_write_bytes(SIGNATURE_BUFFER, SIGNATURE_SIZE);
+    ed25519_write_bytes(PUBLIC_KEY_BUFFER, PUBLIC_KEY_SIZE);
+
+    write_register(ED25519_CMD, ED25519_CMD_START);
+
+    while (1) {
+        uint32_t status = read_register(ED25519_STATUS);
+
+        if ((status & ED25519_ERROR) != 0) {
+            enter_recovery(SR_MANIFEST_SIGNATURE);
+        }
+
+        if ((status & ED25519_DONE) != 0) {
+            if ((status & ED25519_PASS) != 0) {
+                return;
+            }
+            enter_recovery(SR_MANIFEST_SIGNATURE);
+        }
+
+        if (++spin > MAX_SPIN) {
+            enter_recovery(SR_MANIFEST_SIGNATURE);
+        }
+    }
 }
 
 /* Stage 3: read the kernel from flash, hash it, copy to DRAM. Currently
@@ -381,12 +463,35 @@ static void check_and_load_kernel(const manifest_t *manifest)
 }
 
 /* INCREMENT 4: Stage 4 stubbed (will re-enable in INCREMENT 6). */
+/* Stage 4: monotonic rollback counter compare + advance.
+ *
+ * Reject if manifest.version < counter (downgrade attack).
+ * Advance counter if manifest.version > counter, then READ BACK to confirm
+ * the hardware actually latched the new value. The peripheral is supposed
+ * to silently drop writes whose data is ≤ current; if a future hardware
+ * bug or PMP misconfiguration accidentally allowed a backward write, the
+ * readback would catch it. */
 static void check_rollback_counter(const manifest_t *manifest)
 {
     uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
     uint64_t version = (uint64_t)manifest->version;
-    if (version < counter) enter_recovery(SR_ROLLBACK_COUNTER);
-    if (version > counter) write_register64(ROLLBACK_COUNTER_BASE, version);
+
+    if (version < counter) {
+        enter_recovery(SR_ROLLBACK_COUNTER);
+    }
+
+    if (version > counter) {
+        write_register64(ROLLBACK_COUNTER_BASE, version);
+
+        /* Hardware-monotonic readback: counter must have advanced to at
+         * least `version` (could be higher if a concurrent writer raced
+         * us, though we're single-CPU single-thread so that won't
+         * happen). Anything lower means rollback protection broke. */
+        uint64_t updated = read_register64(ROLLBACK_COUNTER_BASE);
+        if (updated < version) {
+            enter_recovery(SR_ROLLBACK_COUNTER);
+        }
+    }
 }
 
 /* pmp uses napot encoding for locked regions */
@@ -490,12 +595,20 @@ static void jump_to_kernel(uint32_t entry_point)
         "fence\n"
         "fence.i\n"
         "csrw mepc, %0\n"
+        /* Explicitly set mstatus.MPP[12:11] = 0b11 (M-mode) so mret keeps
+         * the kernel in M-mode regardless of any prior modification.
+         * Redundant for the happy path (reset default MPP=11 + lock_pmp
+         * doesn't touch MPP) but safe-by-construction in case future
+         * stages temporarily change MPP. `csrs` only sets bits; existing
+         * MPP=11 stays 11, MPP=01 becomes 11. */
+        "li t0, 0x1800\n"
+        "csrs mstatus, t0\n"
         "csrr a0, mhartid\n"
         "li a1, 0\n"
         "mret\n"
         :
         : "r"((uintptr_t)entry_point)
-        : "a0", "a1", "memory"
+        : "t0", "a0", "a1", "memory"
     );
 
     halt();

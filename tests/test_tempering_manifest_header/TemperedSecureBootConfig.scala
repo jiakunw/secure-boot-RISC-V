@@ -23,6 +23,7 @@ class TemperedSecureBootConfig extends Config(
   new chipyard.WithSecureBootOTP() ++
   new chipyard.WithSecureBootRollback() ++
   new chipyard.WithSecureBootSR() ++
+  new chipyard.WithSecureBootEd25519() ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.AbstractConfig
 )

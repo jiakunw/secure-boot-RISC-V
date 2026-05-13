@@ -20,6 +20,8 @@ class SecureBootConfig extends Config(
   new chipyard.WithSecureBootRollback() ++
   // Status register: BootROM writes which verification stage failed; recovery firmware reads it
   new chipyard.WithSecureBootSR() ++
+  // Ed25519 hardware verifier (sim-only BlackBox delegating to host MonoCypher)
+  new chipyard.WithSecureBootEd25519() ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.AbstractConfig
 )

@@ -10,6 +10,7 @@ and hands off to recovery; one positive test verifies a clean boot.
 | [test_tempering_manifest_header](test_tempering_manifest_header/) | manifest magic (`SOBT` → `DEAD`) | Stage 0 (`check_manifest_header`) | `0x01` |
 | [test_tempering_public_key](test_tempering_public_key/) | one byte of public key | Stage 1 (`check_public_key`) | `0x02` |
 | [test_tempering_kernel](test_tempering_kernel/) | entire kernel image (replaced with a malicious binary that would print `bad kernel!`) | Stage 3 (`check_and_load_kernel`) | `0x08` |
+| [test_tempering_version](test_tempering_version/) | manifest `version` field (set to 1, but the rollback counter is elaborated with `resetValue=5` to simulate a prior-newer-firmware bump) | Stage 4 (`check_rollback_counter`) | `0x10` |
 
 ---
 

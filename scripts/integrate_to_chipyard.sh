@@ -126,6 +126,13 @@ if [ -f "$DIGITAL_TOP" ]; then
     else
         echo "  CanHavePeripherySecureBootSR already patched."
     fi
+
+    if ! grep -q "CanHavePeripherySecureBootEd25519" "$DIGITAL_TOP"; then
+        sed -i.bak '/with chipyard.example.CanHavePeripheryGCD/i\  with chipyard.CanHavePeripherySecureBootEd25519 // Stage 2 Ed25519 signature verifier (sim BlackBox delegates to host MonoCypher)' "$DIGITAL_TOP"
+        echo "  Added CanHavePeripherySecureBootEd25519 to DigitalTop."
+    else
+        echo "  CanHavePeripherySecureBootEd25519 already patched."
+    fi
 else
     echo "  Warning: DigitalTop.scala not found; secure boot peripherals will not instantiate."
 fi

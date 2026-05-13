@@ -173,13 +173,13 @@ Stage 5: ┌──────────────────────�
 | 1 | Rollback counter peripheral (64-bit monotonic) | ✅ done | MMIO `0xF0001000` |
 | 2 | SPI Flash master + simulated slave + TL adapter | ✅ done | MMIO `0xF0002000` |
 | 3 | Baseline build pipeline (BootROM → integrate → Verilator → sim) | ✅ done | |
-| **4** | **Full 6-stage BootROM runs end-to-end, stages 2/4 stubbed** | **✅ 4/6 stages real, 2 stubbed** | Stages 0, 1, 3, 5 real (manifest check, OTP-anchored pubkey check, SPI kernel load + SHA-256 verify, PMP lock). Stages 2 (Ed25519 sig) and 4 (rollback counter) stubbed |
+| **4** | **Full 6-stage BootROM runs end-to-end, only stage 2 stubbed** | **✅ 5/6 stages real, 1 stubbed** | Stages 0, 1, 3, 4, 5 all real (manifest check, OTP-anchored pubkey check, SPI kernel load + SHA-256 verify, monotonic rollback counter compare, PMP lock). Only Stage 2 (Ed25519 signature verify) still stubbed pending INCREMENT 7 |
 | **5** | **Real OTP compare in Stage 1 (`check_public_key`)** | **✅ done** | Debug dropbox confirmed `MATCH` between BootROM-computed SHA-256(pubkey) and OTP-burned hash; mismatch triggers `enter_recovery(SR_PUBLIC_KEY)` (bit 1) |
 | **6** | **PMP lock (Stage 5) — real lock active; rollback still stub** | **🚧 PMP only** | `lock_pmp` now writes BootROM=RX+L, OTP/Counter=NO_ACCESS+L, catch-all=RWX+L; BootROM successfully `mret`s to kernel post-lock. Rollback counter check is still stubbed |
 | 7 | Real Ed25519 verify (MonoCypher) in Stage 2 | 🔧 attempted, hangs | Un-stubbed code hangs in sim; previously suspected MonoCypher / OTP but earlier hangs may have been zombie-sim CPU starvation — needs re-test |
 | **+** | **Recovery handler — full mret-to-recovery handoff** | **✅ done — end-to-end** | Separate `recovery.riscv` ELF at `0x80100000` (FESVR-loaded via `+payload=`). `enter_recovery(reason_bit)` writes the SR bit, pre-arms `mtvec` at a `mret_trap_exit` safety stub, then `mret`s to `0x80100000`. Recovery's htif_nano `_start` (full crt0: FP init, TLS, BSS clear, `__libc_init_array`) runs, then `main()` reads SR via MMIO and exits the sim with FESVR exit code = `0x40 \| sr_bits`. The 0x40 marker bit proves end-to-end that the production-faithful mret path executed. |
 | **+** | **Status Register (SR) peripheral — 32-bit boot-status MMIO** | **✅ done** | New peripheral at `0xF0003000` (`hardware/status_register/rtl/sr.scala`). BootROM sets one bit per failed stage (`SR_MANIFEST_HEADER`=0x01, `SR_PUBLIC_KEY`=0x02, …, `SR_LOCK_PMP`=0x20); recovery reads via MMIO and encodes into the FESVR exit code |
-| **+** | **Negative test suite — 3 stages × full 5-6 signal PASS** | **✅ done — all real crypto exercised** | Three tampering tests: (i) `test_tempering_manifest_header` (Stage 0, separate SoC binary with bad-magic flash), (ii) `test_tempering_public_key` (Stage 1, build-time-tampered pubkey, exercises real SHA-256 + OTP compare), (iii) `test_tempering_kernel` (Stage 3, entire kernel image replaced with a malicious binary that would print `"bad kernel!"` if it ran — BootROM SHA-256-rejects it before mret, so the malicious payload never executes). All produce 5- or 6-signal PASS evidence chains with full recovery printf diagnostic visible in sim log. |
+| **+** | **Negative test suite — 4 stages × full 5-6 signal PASS** | **✅ done — all real crypto exercised** | Four tampering tests, each catches a different BootROM stage: (i) `test_tempering_manifest_header` (Stage 0, separate SoC with bad-magic flash), (ii) `test_tempering_public_key` (Stage 1, build-time-tampered pubkey, real SHA-256 + OTP compare), (iii) `test_tempering_kernel` (Stage 3, entire kernel replaced with a malicious binary that would print `"bad kernel!"` if it ran — BootROM SHA-256-rejects it before mret), (iv) `test_tempering_version` (Stage 4, manifest VERSION=1 vs rollback counter pre-bumped to 5 via Scala `resetValue` parameter — models a downgrade attack on a chip whose counter was already advanced by an earlier-installed newer firmware). All four produce 5- or 6-signal PASS evidence chains with full recovery printf diagnostic visible in sim log. |
 
 **Currently shipped (this commit):**
 - All BootROM stages 0, 1, 2, 4, 5 run end-to-end on the happy path (signature + rollback are stubs but the function bodies execute and return).
@@ -213,7 +213,7 @@ Stage 5: ┌──────────────────────�
    - **Stage 1** `check_public_key` — real SHA-256 + OTP-burned-hash compare, recovery on mismatch
    - **Stage 2** `check_manifest_signature` — stub (INCREMENT 7 will un-stub real Ed25519)
    - **Stage 3** `check_and_load_kernel` — real. Reads the entire kernel (7896 bytes) from SPI flash in a *single* transaction directly into DRAM @ `manifest->load_address`, runs SHA-256 over the loaded buffer, compares against `manifest->payload_hash`. Earlier 16-chunk-multi-transaction version hung in the SPI master's state machine after the first transaction; single-shot side-steps the bug.
-   - **Stage 4** `check_rollback_counter` — stub
+   - **Stage 4** `check_rollback_counter` — real. Reads the 64-bit monotonic counter from MMIO `0xF0001000`, compares to `manifest->version`. If `version < counter`, downgrade attack detected → `enter_recovery(SR_ROLLBACK_COUNTER)`. If `version > counter`, BootROM writes the new version back to the counter (hardware-enforced monotonic write — the peripheral silently drops writes whose data is ≤ current value, so even compromised M-mode software cannot move the counter backwards). Tested by `test_tempering_version` (resetValue=5 vs manifest VERSION=1).
    - `clear_scratch` — real (zeros all verification buffers)
    - **Stage 5** `lock_pmp` — real, production-style permissions (see below)
    - `mret` to kernel @ 0x80000000 — kernel boots cleanly in M-mode under PMP isolation
@@ -516,8 +516,8 @@ The execution chain proven by 5 independent log signals:
 
 ## TODO (in priority order)
 
-1. **Re-test INCREMENT 7 (Ed25519)** — earlier hang may have been zombie-sim contention; clean sim re-test could surprise us by working. Stage 2 stubbed currently.
-2. **`test_tempering_signature`** — once Ed25519 is un-stubbed, add a negative test that tampers the signature bytes. Expected exit signal: `boot status register = 0x00000004` (= `SR_MANIFEST_SIGNATURE` bit 2).
+1. **Un-stub Stage 2 (Ed25519 signature verify)** — last remaining stub. Earlier hang attempt may have been zombie-sim CPU contention; clean sim retest could surprise us by working.
+2. **`test_tempering_signature`** — once Stage 2 is real, add a negative test that flips a signature byte (signature won't validate, but manifest+pubkey still pass). Same build-time-tamper pattern as `test_tempering_public_key`. Expected exit signal: `boot status register = 0x00000004` (= `SR_MANIFEST_SIGNATURE` bit 2).
 3. **Performance measurement** — boot time breakdown per stage, BootROM image size, gate count.
 4. **Final report** — design rationale, threat model, measurements, lessons learned.
 

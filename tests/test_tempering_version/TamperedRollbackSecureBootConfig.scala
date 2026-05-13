@@ -33,6 +33,7 @@ class TamperedRollbackSecureBootConfig extends Config(
     resetValue = 5                    // simulate a prior boot bumping counter
   ) ++
   new chipyard.WithSecureBootSR() ++
+  new chipyard.WithSecureBootEd25519() ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.AbstractConfig
 )
