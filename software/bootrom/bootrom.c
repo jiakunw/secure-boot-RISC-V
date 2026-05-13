@@ -383,13 +383,10 @@ static void check_and_load_kernel(const manifest_t *manifest)
 /* INCREMENT 4: Stage 4 stubbed (will re-enable in INCREMENT 6). */
 static void check_rollback_counter(const manifest_t *manifest)
 {
-    (void)manifest;
-    /* Stage 4 rollback compare disabled until INCREMENT 6:
-     * uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
-     * uint64_t version = (uint64_t)manifest->version;
-     * if (version < counter) halt();
-     * if (version > counter) write_register64(ROLLBACK_COUNTER_BASE, version);
-     */
+    uint64_t counter = read_register64(ROLLBACK_COUNTER_BASE);
+    uint64_t version = (uint64_t)manifest->version;
+    if (version < counter) enter_recovery(SR_ROLLBACK_COUNTER);
+    if (version > counter) write_register64(ROLLBACK_COUNTER_BASE, version);
 }
 
 /* pmp uses napot encoding for locked regions */

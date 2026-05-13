@@ -139,13 +139,44 @@ if [ -f "$MYREPO/software/bootrom/Makefile" ]; then
     cd "$MYREPO/software/bootrom"
     make
     if [ -f "bootrom.img" ]; then
-        cp bootrom.img \
-           $CHIPYARD/generators/testchipip/src/main/resources/testchipip/bootrom/bootrom.secureboot.rv64.img
-        mkdir -p "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.SecureBootConfig"
-        cp bootrom.img \
-           "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.SecureBootConfig/bootrom.secureboot.rv64.img"
-        echo "  Built and copied to Chipyard."
-        echo "  Size: $(stat -c%s bootrom.img) bytes"
+        # BootROM staging paths. We MUST copy to BOTH the SBT source
+        # resource dir AND the SBT incremental-compile output dir,
+        # because if SBT thinks testchipip is up to date it won't re-copy
+        # resources from src/main → target/classes/, and the assembly
+        # step will then package the OLD bootrom from target/classes/.
+        RES_DIR=$CHIPYARD/generators/testchipip/src/main/resources/testchipip/bootrom
+        CLS_DIR=$CHIPYARD/generators/testchipip/src/target/scala-2.13/classes/testchipip/bootrom
+        mkdir -p "$RES_DIR" "$CLS_DIR"
+        cp bootrom.img "$RES_DIR/bootrom.secureboot.rv64.img"
+        cp bootrom.img "$CLS_DIR/bootrom.secureboot.rv64.img"
+
+        # Verify md5 matches at both staging paths — silent stale-copy
+        # bugs are extremely painful to debug, so fail loudly here.
+        SRC_MD5=$(md5sum bootrom.img        | awk '{print $1}')
+        RES_MD5=$(md5sum "$RES_DIR/bootrom.secureboot.rv64.img" | awk '{print $1}')
+        CLS_MD5=$(md5sum "$CLS_DIR/bootrom.secureboot.rv64.img" | awk '{print $1}')
+        if [ "$SRC_MD5" != "$RES_MD5" ] || [ "$SRC_MD5" != "$CLS_MD5" ]; then
+            echo "  Error: bootrom md5 mismatch after copy"
+            echo "    source:    $SRC_MD5"
+            echo "    resources: $RES_MD5"
+            echo "    classes:   $CLS_MD5"
+            exit 1
+        fi
+
+        # Invalidate downstream caches so the next `make CONFIG=…` actually
+        # picks up the new bootrom:
+        #   - chipyard.jar:    SBT's assembly output (packages bootrom from classes/)
+        #   - generated-src/:  Verilator elaboration output (bakes bootrom into TLROM.sv)
+        #   - sim binary:      Verilator-built C++ executable
+        rm -f "$CHIPYARD/.classpath_cache/chipyard.jar"
+        rm -rf "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.SecureBootConfig"
+        rm -rf "$CHIPYARD/sims/verilator/generated-src/chipyard.harness.TestHarness.TemperedSecureBootConfig"
+        rm -f  "$CHIPYARD/sims/verilator/simulator-chipyard.harness-SecureBootConfig"
+        rm -f  "$CHIPYARD/sims/verilator/simulator-chipyard.harness-TemperedSecureBootConfig"
+
+        echo "  Built, staged, and downstream caches invalidated."
+        echo "  Size:  $(stat -c%s bootrom.img) bytes"
+        echo "  md5:   $SRC_MD5"
     else
         echo "  Error: bootrom.img not produced"
         exit 1
@@ -257,15 +288,30 @@ echo "============================================"
 echo "Integration complete."
 echo "============================================"
 echo ""
+echo "  BootROM staged at both src/main/resources/ and src/target/classes/"
+echo "  chipyard.jar + generated-src + sim binaries invalidated"
+echo "  → next \`make CONFIG=…\` will fully re-elaborate (~15-25 min)"
+echo ""
 echo "To run with default Chipyard config (no secure boot):"
 echo "  cd $CHIPYARD/sims/verilator"
 echo "  make CONFIG=RocketConfig"
 echo "  ./simulator-chipyard.harness-RocketConfig $KERNEL_REPO_DIR/kernel.riscv"
 echo ""
-echo "To run with your secure boot config (recovery passed via +payload=,"
-echo "which is FESVR's way to load extra ELFs alongside the primary kernel):"
+echo "To run with the secure-boot SoC (recovery passed via +payload=,"
+echo "which is FESVR's mechanism to load extra ELFs alongside the primary"
+echo "kernel — positional targs[1+] are silently ignored by FESVR):"
 echo "  cd $CHIPYARD/sims/verilator"
-echo "  make CONFIG=SecureBootConfig"
+echo "  make -j\$(nproc) CONFIG=SecureBootConfig"
 echo "  ./simulator-chipyard.harness-SecureBootConfig \\"
 echo "      +payload=$MYREPO/software/recovery/recovery.riscv \\"
 echo "      $KERNEL_REPO_DIR/kernel.riscv"
+echo ""
+echo "For the tampered-manifest negative test (separate SoC binary):"
+echo "  bash $MYREPO/tests/test_tempering_manifest_header/build.sh   # one-time, ~20 min"
+echo "  bash $MYREPO/tests/test_tempering_manifest_header/run.sh"
+echo ""
+echo "For the kernel/pubkey negative tests (reuse SecureBootConfig sim):"
+echo "  bash $MYREPO/tests/test_tempering_public_key/build.sh         # one-time, ~5 sec"
+echo "  bash $MYREPO/tests/test_tempering_kernel/build.sh             # one-time, ~5 sec"
+echo "  bash $MYREPO/tests/test_tempering_public_key/run.sh"
+echo "  bash $MYREPO/tests/test_tempering_kernel/run.sh"

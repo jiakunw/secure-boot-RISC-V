@@ -9,7 +9,15 @@ import freechips.rocketchip.regmapper._
 import freechips.rocketchip.subsystem.{BaseSubsystem, PBUS}
 
 // --- 1. Parameters & Key ---
-case class SecureBootRollbackParams(address: BigInt = 0xF0001000L)
+// resetValue: initial value of the monotonic counter at reset. Default 0
+// for real-silicon-faithful behavior. Tests can elaborate with a non-zero
+// value to simulate "a previously-installed newer firmware already bumped
+// the counter" — normally a persistent effect of an earlier boot, but in
+// sim the counter resets to 0 every run (no eFuse backing).
+case class SecureBootRollbackParams(
+    address:    BigInt = 0xF0001000L,
+    resetValue: BigInt = 0
+)
 
 case object SecureBootRollbackKey extends Field[Option[SecureBootRollbackParams]](None)
 
@@ -30,7 +38,9 @@ class SecureBootRollbackCounterTL(params: SecureBootRollbackParams, beatBytes: I
       // Hardware-enforced monotonic counter.
       // RegInit means simulation cannot demonstrate cross-reset persistence —
       // real silicon would back this with eFuse / anti-fuse storage.
-      val version = RegInit(0.U(64.W))
+      // Default resetValue=0; tests can pre-load the counter via the
+      // SecureBootRollbackParams parameter to simulate post-bump state.
+      val version = RegInit(params.resetValue.U(64.W))
 
       node.regmap(
         0x00 -> Seq(RegField(64,
@@ -68,7 +78,9 @@ trait CanHavePeripherySecureBootRollback { this: BaseSubsystem =>
 }
 
 // --- 4. The Config Class ---
-class WithSecureBootRollback(address: BigInt = 0xF0001000L)
-  extends Config((site, here, up) => {
-    case SecureBootRollbackKey => Some(SecureBootRollbackParams(address))
+class WithSecureBootRollback(
+    address:    BigInt = 0xF0001000L,
+    resetValue: BigInt = 0
+) extends Config((site, here, up) => {
+    case SecureBootRollbackKey => Some(SecureBootRollbackParams(address, resetValue))
   })
